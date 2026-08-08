@@ -193,15 +193,15 @@ const NODE_META: Record<
 };
 
 const NODE_POSITIONS: Record<ChangeKind, { x: number; y: number }> = {
-  contract: { x: 0, y: 190 },
-  routing: { x: 300, y: 190 },
-  error: { x: 610, y: 30 },
-  fallback: { x: 610, y: 190 },
-  state: { x: 920, y: 190 },
-  output: { x: 1230, y: 190 },
-  config: { x: 610, y: 390 },
-  test: { x: 920, y: 390 },
-  unknown: { x: 0, y: 410 },
+  contract: { x: 0, y: 150 },
+  routing: { x: 250, y: 150 },
+  error: { x: 500, y: 0 },
+  fallback: { x: 500, y: 150 },
+  state: { x: 750, y: 150 },
+  output: { x: 750, y: 320 },
+  config: { x: 500, y: 320 },
+  test: { x: 250, y: 320 },
+  unknown: { x: 0, y: 320 },
 };
 
 function parseDiff(diff: string): ChangedLine[] {
@@ -466,6 +466,7 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState("routing");
   const [status, setStatus] = useState<"idle" | "running" | "complete" | "error">("complete");
   const [message, setMessage] = useState("Sample analysis ready. Select any graph node.");
+  const [mobilePanel, setMobilePanel] = useState<"input" | "graph" | "inspect">("graph");
 
   const selectedNode = useMemo(
     () => analysis.nodes.find((node) => node.id === selectedId) ?? analysis.nodes[0],
@@ -487,6 +488,7 @@ export default function Home() {
         setSelectedId(result.nodes.find((node) => node.id === "routing")?.id ?? result.nodes[0]?.id ?? "");
         setMessage("All changed lines mapped. POC mode made no external AI call.");
         setStatus("complete");
+        setMobilePanel("graph");
         return;
       }
 
@@ -507,6 +509,7 @@ export default function Home() {
       setSelectedId(result.nodes[0]?.id ?? "");
       setMessage(`Provider call completed. ${result.covered - result.unknown}/${result.covered} lines classified; exact code remains grounded in the diff.`);
       setStatus("complete");
+      setMobilePanel("graph");
     } catch (error) {
       setStatus("error");
       setMessage(error instanceof Error ? error.message : "Analysis failed.");
@@ -536,7 +539,20 @@ export default function Home() {
         </div>
       </header>
 
-      <div className="workspace">
+      <nav className="mobile-nav" aria-label="Change review sections">
+        <button type="button" className={mobilePanel === "input" ? "active" : ""} onClick={() => setMobilePanel("input")}>
+          <span>01</span> Input
+        </button>
+        <button type="button" className={mobilePanel === "graph" ? "active" : ""} onClick={() => setMobilePanel("graph")}>
+          <span>02</span> Graph
+        </button>
+        <button type="button" className={mobilePanel === "inspect" ? "active" : ""} onClick={() => setMobilePanel("inspect")}>
+          <span>03</span> Details
+          {selectedNode ? <i>{selectedNode.data.lineIds.length}</i> : null}
+        </button>
+      </nav>
+
+      <div className={`workspace mobile-panel-${mobilePanel}`}>
         <aside className="input-panel">
           <div className="panel-heading">
             <span className="step-number">01</span>
@@ -622,9 +638,12 @@ export default function Home() {
               nodes={analysis.nodes}
               edges={analysis.edges}
               nodeTypes={nodeTypes}
-              onNodeClick={(_, node) => setSelectedId(node.id)}
+              onNodeClick={(_, node) => {
+                setSelectedId(node.id);
+                setMobilePanel("inspect");
+              }}
               fitView
-              fitViewOptions={{ padding: 0.18 }}
+              fitViewOptions={{ padding: 0.08 }}
               minZoom={0.35}
               maxZoom={1.7}
               proOptions={{ hideAttribution: true }}
