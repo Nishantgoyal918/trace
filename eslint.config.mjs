@@ -13,6 +13,8 @@ const eslintConfig = defineConfig([
     "dist/**",
     "out/**",
     "build/**",
+    ".validation-python/**",
+    ".changegraph/**",
     "next-env.d.ts",
   ]),
   eslint.configs.recommended,

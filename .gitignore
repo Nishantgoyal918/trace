@@ -38,3 +38,8 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+/.pnpm-store/
+*.tsbuildinfo
+/.validation-python/
+/.changegraph/
+/.changegraph-dev.*.log

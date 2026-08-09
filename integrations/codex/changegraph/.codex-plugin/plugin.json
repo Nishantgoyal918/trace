@@ -1,0 +1,24 @@
+{
+  "name": "changegraph",
+  "version": "0.2.0",
+  "description": "Continuously map existing code and exact before-to-after changes in a live semantic graph.",
+  "author": {
+    "name": "ChangeGraph"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ChangeGraph",
+    "shortDescription": "See how code works and exactly what changed.",
+    "longDescription": "ChangeGraph connects Codex to a local semantic index and colorful graph dashboard. It analyzes repositories in parallel, reuses unchanged file results, and makes every changed line, fallback, error path, state transition, output, configuration, and test visible.",
+    "developerName": "ChangeGraph",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive"],
+    "defaultPrompt": [
+      "Map this repository in ChangeGraph.",
+      "Review my current diff in ChangeGraph.",
+      "Show every fallback introduced by this change."
+    ],
+    "brandColor": "#6C5CE7"
+  },
+  "mcpServers": "./.mcp.json"
+}

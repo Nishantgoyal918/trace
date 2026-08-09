@@ -1,30 +1,29 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "ChangeGraph — understand every changed line",
-  description: "A graph-first review interface for understanding large AI-generated code changes line by line.",
+  title: "ChangeGraph — understand code before reviewing changes",
+  description:
+    "A graph-first workspace for understanding existing code and then reviewing every changed line against that baseline.",
   openGraph: {
-    title: "ChangeGraph — understand every changed line",
-    description: "A graph-first review interface for large AI-generated code changes.",
-    images: [{ url: "/changegraph-og.png", width: 1664, height: 960, alt: "Semantic code changes shown as a directed graph" }],
+    title: "ChangeGraph — understand code before reviewing changes",
+    description:
+      "Map existing code, then explain every changed line against that baseline.",
+    images: [
+      {
+        url: "/changegraph-og-v2.png",
+        width: 1664,
+        height: 960,
+        alt: "A colorful semantic map showing connected code concepts and an exact before-to-after change",
+      },
+    ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "ChangeGraph — understand every changed line",
-    description: "A graph-first review interface for large AI-generated code changes.",
-    images: ["/changegraph-og.png"],
+    title: "ChangeGraph — understand code before reviewing changes",
+    description:
+      "Map existing code, then explain every changed line against that baseline.",
+    images: ["/changegraph-og-v2.png"],
   },
   icons: {
     icon: "/favicon.svg",
@@ -39,11 +38,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
-        {children}
-      </body>
+      <body>{children}</body>
     </html>
   );
 }

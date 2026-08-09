@@ -1,0 +1,9 @@
+{
+  "name": "changegraph",
+  "version": "0.2.0",
+  "description": "Map existing code and exact behavior changes in a live semantic graph.",
+  "author": {
+    "name": "ChangeGraph"
+  }
+}
+

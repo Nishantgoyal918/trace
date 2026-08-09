@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "changegraph": {
+      "command": "node",
+      "args": [
+        "C:/Users/nisha/Documents/Codex/2026-08-08/btw/integrations/shared/changegraph-mcp.mjs"
+      ]
+    }
+  }
+}
