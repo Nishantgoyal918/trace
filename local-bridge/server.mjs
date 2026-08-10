@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
+import { promisify } from "node:util";
 import { Codex } from "@openai/codex-sdk";
 
 const PORT = Number(process.env.CHANGEGRAPH_CODEX_PORT || 47831);
@@ -19,8 +21,11 @@ const CODEX_REQUEST_TIMEOUT_MS = Number.isFinite(configuredCodexTimeout) && conf
   : DEFAULT_CODEX_TIMEOUT_MS;
 const PROMPT_VERSION = "semantic-v9-multi-axis-journeys";
 const CACHE_DIR = path.resolve(process.env.CHANGEGRAPH_CACHE_DIR || ".changegraph/cache");
+const GRAPH_DIR = path.resolve(process.env.CHANGEGRAPH_GRAPH_DIR || ".changegraph/graphs");
+const GRAPH_RECORD_VERSION = 1;
 const jobs = new Map();
 const inFlight = new Map();
+const execFileAsync = promisify(execFile);
 let latestJobId = null;
 
 const CODE_EXTENSIONS = new Set([
@@ -30,6 +35,77 @@ const CODE_EXTENSIONS = new Set([
 ]);
 const SKIPPED_DIRECTORIES = new Set([".git", ".next", ".turbo", ".venv", "build", "coverage", "dist", "node_modules", "out", "target", "vendor"]);
 const SEMANTIC_KINDS = ["structure", "contract", "flow", "routing", "error", "fallback", "state", "output", "config", "test", "unknown"];
+
+function sha256(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
+}
+
+async function gitValue(rootPath, args) {
+  if (!rootPath) return "";
+  try {
+    const result = await execFileAsync("git", ["-C", rootPath, ...args], {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return String(result.stdout || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function snapshotMetadata(repository, source, { assumeCurrent = false } = {}) {
+  const snapshotHash = sha256(source);
+  const repositoryPath = repository?.path ? path.resolve(repository.path) : "";
+  const repositoryRoot = await gitValue(repositoryPath, ["rev-parse", "--show-toplevel"]);
+  const gitRoot = repositoryRoot ? path.resolve(repositoryRoot) : repositoryPath;
+  const remote = await gitValue(gitRoot, ["remote", "get-url", "origin"]);
+  const branch = await gitValue(gitRoot, ["branch", "--show-current"]);
+  const headCommit = await gitValue(gitRoot, ["rev-parse", "HEAD"]);
+  const status = await gitValue(gitRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const normalizedPath = gitRoot
+    ? (process.platform === "win32" ? gitRoot.toLowerCase() : gitRoot)
+    : String(repository?.name || "pasted-source");
+  const repositoryIdentity = remote ? `git:${remote}` : `path:${normalizedPath}`;
+  let matchesCurrentWorkingTree = repositoryPath ? assumeCurrent : null;
+  if (repositoryPath && !assumeCurrent) {
+    try {
+      const currentFiles = await collectRepository(repositoryPath);
+      matchesCurrentWorkingTree = sha256(repositorySource(currentFiles)) === snapshotHash;
+    } catch {
+      matchesCurrentWorkingTree = null;
+    }
+  }
+  return {
+    hash: snapshotHash,
+    repositoryKey: sha256(repositoryIdentity).slice(0, 24),
+    promptVersion: PROMPT_VERSION,
+    capturedAt: new Date().toISOString(),
+    git: headCommit ? {
+      root: gitRoot,
+      remote: remote || null,
+      branch: branch || "detached",
+      headCommit,
+      dirty: Boolean(status),
+      matchesCurrentWorkingTree,
+      observedAt: new Date().toISOString(),
+    } : null,
+  };
+}
+
+async function writeJsonAtomic(filePath, value) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify(value), "utf8");
+  await rename(temporaryPath, filePath);
+}
+
+function resolveStoredRecord(relativePath) {
+  const resolved = path.resolve(GRAPH_DIR, String(relativePath || ""));
+  const relative = path.relative(GRAPH_DIR, resolved);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Stored graph pointer is invalid.");
+  return resolved;
+}
 
 const ANALYSIS_SCHEMA = {
   type: "object",
@@ -830,10 +906,81 @@ function publicJob(job) {
     activeUnits: job.activeUnits,
     fresh: job.fresh,
     error: job.error,
+    persistenceError: job.persistenceError || null,
     source: job.source,
     analysis,
+    snapshot: job.snapshot || null,
     dashboardUrl: `${DASHBOARD_URL}/?job=${job.id}`,
   };
+}
+
+async function persistJobView(jobView, { assumeCurrent = false, imported = false } = {}) {
+  if (!jobView?.id || !/^[a-f0-9-]{20,}$/i.test(jobView.id)) throw new Error("Persisted graph requires a valid job id.");
+  if (!jobView?.repository || typeof jobView.source !== "string" || !jobView.analysis?.nodes || !jobView.analysis?.edges) {
+    throw new Error("Persisted graph is missing its repository snapshot or semantic graph.");
+  }
+  const snapshot = jobView.snapshot?.hash
+    ? jobView.snapshot
+    : await snapshotMetadata(jobView.repository, jobView.source, { assumeCurrent });
+  const storedAt = new Date().toISOString();
+  const recordPath = path.join(
+    GRAPH_DIR,
+    "repos",
+    snapshot.repositoryKey,
+    snapshot.hash,
+    `${jobView.id}.json`,
+  );
+  const graph = {
+    ...jobView,
+    snapshot,
+    persisted: true,
+    storage: {
+      version: GRAPH_RECORD_VERSION,
+      storedAt,
+      imported,
+      key: `${snapshot.repositoryKey}:${snapshot.hash}:${snapshot.promptVersion}`,
+    },
+    dashboardUrl: `${DASHBOARD_URL}/?job=${jobView.id}`,
+  };
+  const relativeRecordPath = path.relative(GRAPH_DIR, recordPath).replaceAll("\\", "/");
+  const pointer = { version: GRAPH_RECORD_VERSION, jobId: jobView.id, recordPath: relativeRecordPath, storedAt };
+  await writeJsonAtomic(recordPath, { version: GRAPH_RECORD_VERSION, graph });
+  await Promise.all([
+    writeJsonAtomic(path.join(GRAPH_DIR, "jobs", `${jobView.id}.json`), pointer),
+    writeJsonAtomic(path.join(GRAPH_DIR, "latest.json"), pointer),
+    writeJsonAtomic(path.join(GRAPH_DIR, "repos", snapshot.repositoryKey, "latest.json"), pointer),
+    writeJsonAtomic(path.join(GRAPH_DIR, "repos", snapshot.repositoryKey, snapshot.hash, "latest.json"), pointer),
+  ]);
+  return graph;
+}
+
+async function readStoredGraph(pointerPath) {
+  try {
+    const pointer = JSON.parse(await readFile(pointerPath, "utf8"));
+    const record = JSON.parse(await readFile(resolveStoredRecord(pointer.recordPath), "utf8"));
+    if (record?.version !== GRAPH_RECORD_VERSION || !record.graph?.id) return null;
+    return {
+      ...record.graph,
+      persisted: true,
+      dashboardUrl: `${DASHBOARD_URL}/?job=${record.graph.id}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function persistedJob(jobId) {
+  return readStoredGraph(path.join(GRAPH_DIR, "jobs", `${jobId}.json`));
+}
+
+async function latestPersistedJob() {
+  return readStoredGraph(path.join(GRAPH_DIR, "latest.json"));
+}
+
+async function persistJob(job) {
+  const graph = await persistJobView(publicJob(job), { assumeCurrent: true });
+  job.snapshot = graph.snapshot;
+  return graph;
 }
 
 async function runJob(job, batches) {
@@ -899,6 +1046,12 @@ async function runJob(job, batches) {
     job.error = error instanceof Error ? error.message : "Unknown analysis error";
     job.updatedAt = new Date().toISOString();
   }
+  try {
+    await persistJob(job);
+  } catch (error) {
+    job.persistenceError = error instanceof Error ? error.message : "Could not persist this graph.";
+    console.error(`Could not persist graph ${job.id}: ${job.persistenceError}`);
+  }
 }
 
 async function createJob(body) {
@@ -917,6 +1070,9 @@ async function createJob(body) {
   const id = randomUUID();
   const now = new Date().toISOString();
   const fresh = body.fresh === true;
+  const snapshot = await snapshotMetadata(repository, source, {
+    assumeCurrent: mode === "baseline" && Boolean(repository?.path),
+  });
   const job = {
     id,
     status: "queued",
@@ -940,6 +1096,8 @@ async function createJob(body) {
     analyses: new Array(batches.length),
     crossEdges: [],
     error: null,
+    persistenceError: null,
+    snapshot,
     createdAt: now,
     updatedAt: now,
   };
@@ -970,18 +1128,22 @@ const server = createServer(async (request, response) => {
       parallelWorkers: PARALLEL_WORKERS,
       requestTimeoutMinutes: Math.round(CODEX_REQUEST_TIMEOUT_MS / 60_000),
       cache: CACHE_DIR,
+      graphStore: GRAPH_DIR,
       activeJobs: [...jobs.values()].filter((job) => ["queued", "analyzing", "connecting"].includes(job.status)).length,
     }, headers);
     return;
   }
   if (request.method === "GET" && request.url === "/jobs/latest") {
-    const job = latestJobId ? jobs.get(latestJobId) : null;
-    send(response, job ? 200 : 404, job ? publicJob(job) : { error: "No ChangeGraph job has been created." }, headers);
+    const liveJob = latestJobId ? jobs.get(latestJobId) : null;
+    const job = liveJob ? publicJob(liveJob) : await latestPersistedJob();
+    send(response, job ? 200 : 404, job || { error: "No ChangeGraph job has been created." }, headers);
     return;
   }
   const requestUrl = new URL(request.url || "/", `http://127.0.0.1:${PORT}`);
   if (request.method === "GET" && requestUrl.pathname === "/file") {
-    const job = jobs.get(requestUrl.searchParams.get("job") || "");
+    const jobId = requestUrl.searchParams.get("job") || "";
+    const liveJob = jobs.get(jobId);
+    const job = liveJob ? publicJob(liveJob) : await persistedJob(jobId);
     const requestedPath = (requestUrl.searchParams.get("path") || "").replaceAll("\\", "/");
     if (!job?.repository?.path || !requestedPath) {
       send(response, 404, { error: "Repository file is unavailable for this job." }, headers);
@@ -1004,8 +1166,9 @@ const server = createServer(async (request, response) => {
   }
   const jobMatch = request.url?.match(/^\/jobs\/([a-f0-9-]+)$/i);
   if (request.method === "GET" && jobMatch) {
-    const job = jobs.get(jobMatch[1]);
-    send(response, job ? 200 : 404, job ? publicJob(job) : { error: "ChangeGraph job not found." }, headers);
+    const liveJob = jobs.get(jobMatch[1]);
+    const job = liveJob ? publicJob(liveJob) : await persistedJob(jobMatch[1]);
+    send(response, job ? 200 : 404, job || { error: "ChangeGraph job not found." }, headers);
     return;
   }
 
@@ -1021,6 +1184,12 @@ const server = createServer(async (request, response) => {
       send(response, 202, job, headers);
       return;
     }
+    if (request.method === "POST" && request.url === "/jobs/import") {
+      const graph = await persistJobView(await readJson(request), { imported: true });
+      latestJobId = graph.id;
+      send(response, 201, graph, headers);
+      return;
+    }
   } catch (error) {
     send(response, 500, {
       error: `ChangeGraph local service failed: ${error instanceof Error ? error.message : "unknown error"}. No fallback provider was used.`,
@@ -1034,4 +1203,5 @@ const server = createServer(async (request, response) => {
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`ChangeGraph local service listening on http://127.0.0.1:${PORT}`);
   console.log(`Parallel workers: ${PARALLEL_WORKERS}; cache: ${CACHE_DIR}`);
+  console.log(`Persistent graphs: ${GRAPH_DIR}`);
 });

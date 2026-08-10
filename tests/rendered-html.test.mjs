@@ -218,6 +218,14 @@ test("keeps both AI provider paths explicit", async () => {
   assert.match(bridge, /journey_reading_order/);
   assert.match(bridge, /journey_stage_order/);
   assert.match(bridge, /\/jobs/);
+  assert.match(bridge, /CHANGEGRAPH_GRAPH_DIR/);
+  assert.match(bridge, /\.changegraph\/graphs/);
+  assert.match(bridge, /function snapshotMetadata/);
+  assert.match(bridge, /rev-parse", "HEAD/);
+  assert.match(bridge, /matchesCurrentWorkingTree/);
+  assert.match(bridge, /persistJobView/);
+  assert.match(bridge, /latestPersistedJob/);
+  assert.match(bridge, /"\/jobs\/import"/);
   assert.match(bridge, /requestUrl\.pathname === "\/file"/);
   assert.match(bridge, /outside the analyzed repository/);
   assert.doesNotMatch(bridge, /Input is too large for this POC|220_000/);
