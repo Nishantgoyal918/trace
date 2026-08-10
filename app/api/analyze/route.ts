@@ -26,9 +26,9 @@ const ANALYSIS_SCHEMA = {
           title: { type: "string" },
           codeIdentity: { type: "string" },
           kind: { type: "string", enum: SEMANTIC_KINDS },
-          summary: { type: "string" },
-          before: { type: "string" },
-          after: { type: "string" },
+          summary: { type: "string", description: "Four to seven complete plain-English bullet points separated by newlines; every line starts with - " },
+          before: { type: "string", description: "For change analysis, two to five complete prior-behavior bullet points separated by newlines; empty for baseline" },
+          after: { type: "string", description: "For change analysis, two to five complete new-behavior bullet points separated by newlines; empty for baseline" },
           lineIds: { type: "array", items: { type: "string" } },
           confidence: { type: "string", enum: ["high", "medium", "low"] },
           provides: { type: "array", items: { type: "string" } },
@@ -73,9 +73,10 @@ const INTEGRATION_SCHEMA = {
   },
 };
 
-const JOURNEY_PHASES = ["foundation", "identity", "exploration", "core-workflow", "background-work", "delivery", "recovery", "operations"];
-const JOURNEY_STAGES = ["entry", "validation", "core", "data", "external", "output", "async", "fallback", "error"];
-const JOURNEY_BRANCHES = ["main", "async", "fallback", "error"];
+const JOURNEY_PHASES = ["foundation", "queries", "commands", "automation", "recovery", "operations"];
+const JOURNEY_FLOW_ROLES = ["trigger", "guard", "orchestration", "computation", "side-effect", "result"];
+const JOURNEY_LANES = ["main", "async", "rejection", "retry", "fallback", "error", "compensation"];
+const JOURNEY_BOUNDARIES = ["frontend", "backend", "database", "cache", "queue", "object-storage", "filesystem", "internal-service", "external-api"];
 
 const JOURNEY_ORDER_SCHEMA = {
   type: "object",
@@ -87,10 +88,11 @@ const JOURNEY_ORDER_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["journeyId", "phase", "sequence", "rationale"],
+        required: ["journeyId", "phase", "capability", "sequence", "rationale"],
         properties: {
           journeyId: { type: "string" },
           phase: { type: "string", enum: JOURNEY_PHASES },
+          capability: { type: "string" },
           sequence: { type: "number" },
           rationale: { type: "string" },
         },
@@ -102,7 +104,7 @@ const JOURNEY_ORDER_SCHEMA = {
 const JOURNEY_STAGE_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["journeyId", "summary", "steps"],
+  required: ["journeyId", "summary", "steps", "resources", "excludedNodes"],
   properties: {
     journeyId: { type: "string" },
     summary: { type: "string" },
@@ -111,13 +113,40 @@ const JOURNEY_STAGE_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["nodeId", "stage", "branch", "sequence"],
+        required: ["nodeId", "flowRole", "lane", "sequence", "predecessorIds", "boundaryRefs", "confidence", "evidence"],
         properties: {
           nodeId: { type: "string" },
-          stage: { type: "string", enum: JOURNEY_STAGES },
-          branch: { type: "string", enum: JOURNEY_BRANCHES },
+          flowRole: { type: "string", enum: JOURNEY_FLOW_ROLES },
+          lane: { type: "string", enum: JOURNEY_LANES },
           sequence: { type: "number" },
+          predecessorIds: { type: "array", items: { type: "string" } },
+          boundaryRefs: { type: "array", items: { type: "string" } },
+          confidence: { type: "string", enum: ["high", "medium", "low"] },
+          evidence: { type: "string" },
         },
+      },
+    },
+    resources: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["resourceId", "name", "kind", "systemBoundary"],
+        properties: {
+          resourceId: { type: "string" },
+          name: { type: "string" },
+          kind: { type: "string", enum: JOURNEY_BOUNDARIES },
+          systemBoundary: { type: "string", enum: ["internal", "external"] },
+        },
+      },
+    },
+    excludedNodes: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["nodeId", "reason"],
+        properties: { nodeId: { type: "string" }, reason: { type: "string" } },
       },
     },
   },
@@ -125,19 +154,21 @@ const JOURNEY_STAGE_SCHEMA = {
 
 function buildJourneyOrderingPrompt(body: { orderingKind?: string; journeys?: unknown[]; journey?: unknown; nodes?: unknown[]; edges?: unknown[] }) {
   if (body.orderingKind === "stages") {
-    return `You organize one already-discovered software journey for human reading. You may only classify and order supplied nodes; never invent, omit, merge, or duplicate nodes, and never create relationships.
+    return `You organize one already-discovered software journey for human reading. Separate runtime sequence, alternate control-flow lanes, and system boundaries instead of mixing them into one stage label.
 
 Return ONLY valid JSON matching this shape:
-{"journeyId":"existing-journey-id","summary":"one short plain-English description of the reading path","steps":[{"nodeId":"existing-node-id","stage":"entry|validation|core|data|external|output|async|fallback|error","branch":"main|async|fallback|error","sequence":0}]}
+{"journeyId":"existing-journey-id","summary":"one short plain-English description of the reading path","steps":[{"nodeId":"existing-node-id","flowRole":"trigger|guard|orchestration|computation|side-effect|result","lane":"main|async|rejection|retry|fallback|error|compensation","sequence":0,"predecessorIds":["existing-node-id"],"boundaryRefs":["resource-id"],"confidence":"high|medium|low","evidence":"short observable reason"}],"resources":[{"resourceId":"stable-short-id","name":"concrete system or store name","kind":"frontend|backend|database|cache|queue|object-storage|filesystem|internal-service|external-api","systemBoundary":"internal|external"}],"excludedNodes":[{"nodeId":"existing-node-id","reason":"why this candidate is not part of this runtime behavior"}]}
 
 Rules:
-- Include every supplied node ID exactly once.
-- The main path should read from trigger to observable result.
-- Use entry for the trigger or receiving boundary, validation for checks and guards, core for decisions and transformations, data for persistence, external for outside services, and output for returned or visible results.
-- Put background work in async, alternative/retry behavior in fallback, and terminal failures in error.
-- Sequence is the recommended reading order across the whole journey. Respect supplied edge direction when it represents runtime control or information flow.
+- Put every supplied node ID in either steps or excludedNodes exactly once. Exclude a node only when the evidence shows it belongs to a different behavior and was pulled in by a shared dependency or discovery heuristic.
+- flowRole answers what the behavior does on the main runtime path: trigger starts it; guard admits or rejects it; orchestration coordinates calls and decisions; computation transforms or derives values; side-effect changes state, sends data, or invokes a boundary; result exposes the outcome.
+- lane is independent of flowRole. Use main for the normal path, async for detached work, rejection for expected guard refusal, retry for another attempt, fallback for an alternate path, error for unexpected failure, and compensation for rollback or cleanup.
+- Do not label a database, cache, queue, storage service, frontend, backend, or API as a stage. Add it once to resources and reference it from the relevant steps with boundaryRefs.
+- external means outside the analyzed repository or product boundary. A different file, module, frontend, or backend inside this repository is internal.
+- predecessorIds must contain only supplied node IDs with a supported direct runtime relationship. Do not infer a predecessor merely because two nodes share a resource.
+- Sequence is the recommended reading order across the whole journey. Respect supplied edge direction when it represents runtime control or information flow; order alternate lanes immediately after the main step that branches to them.
 - Keep unrelated branches separate. Do not treat a shared dependency as proof that two behaviors are one path.
-- The summary must describe observable software behavior, not your reasoning process.
+- confidence and evidence must communicate how directly the classification is supported without exposing hidden reasoning. The summary must describe observable software behavior.
 
 Journey:
 ${JSON.stringify(body.journey)}
@@ -151,11 +182,13 @@ ${JSON.stringify(body.edges)}`;
   return `You organize already-discovered end-to-end software journeys into the order an engineer should read them to understand the system. You may only order and categorize supplied journey IDs; never merge, omit, duplicate, or invent journeys.
 
 Return ONLY valid JSON matching this shape:
-{"journeys":[{"journeyId":"existing-journey-id","phase":"foundation|identity|exploration|core-workflow|background-work|delivery|recovery|operations","sequence":0,"rationale":"one short plain-English reason this belongs here"}]}
+{"journeys":[{"journeyId":"existing-journey-id","phase":"foundation|queries|commands|automation|recovery|operations","capability":"short product-specific capability name","sequence":0,"rationale":"one short plain-English reason this belongs here"}]}
 
 Rules:
 - Include every supplied journey ID exactly once.
-- Create a coherent system narrative: foundation and startup, identity and access, read/exploration paths, core workflows, background work, delivery of results, recovery/failure handling, then operations/admin paths.
+- phase describes behavior shape, not product domain: foundation is startup/configuration; queries read without intending to change state; commands create or change state; automation is event, queue, worker, scheduled, or background work; recovery restores or compensates; operations covers administration, maintenance, and observability.
+- capability is the product-specific domain, such as Identity, Catalog, Billing, or Rendering. Do not use capability to decide phase: login may be a command and reading the current user may be a query even though both belong to Identity.
+- Order a coherent system narrative from prerequisites through user-facing queries and commands, follow-on automation, recovery paths, and operations.
 - Sequence journeys meaningfully within their phase using prerequisites, triggers, produced state, and observable outcomes.
 - Shared endpoints, databases, workers, or services do not make two journeys the same. Preserve every distinct behavior journey.
 - Do not claim relationships not present in the supplied contracts or behavior summaries.
@@ -166,8 +199,8 @@ ${JSON.stringify(body.journeys)}`;
 }
 
 function buildPrompt(mode: ReviewMode, task: string, content: string, inventory: InventoryLine[], baselineContext: unknown[] = []) {
-  const baselineRules = `Build a semantic map of the existing code for an engineer seeing this repository for the first time. For every node, explain what starts the behavior, what the code does in order, which decisions it makes, and what it returns, changes, stores, calls, or does on failure. Set before and after to empty strings.`;
-  const changeRules = `Explain the diff against an already-understood baseline for an engineer seeing this change for the first time. Describe the exact behavior or structure before and after, including the trigger, ordered actions, decisions, result, side effects, errors, and fallbacks. Make every fallback, error route, state access, output, contract, configuration, and test change explicit.`;
+  const baselineRules = `Build a semantic map of the existing code for an engineer seeing this repository for the first time. For every node, explain what starts the behavior, what the code does in order, which decisions it makes, and what it returns, changes, stores, calls, or does on failure. Put that complete explanation into ordered bullet points. Set before and after to empty strings.`;
+  const changeRules = `Explain the diff against an already-understood baseline for an engineer seeing this change for the first time. Describe the exact behavior or structure before and after as ordered bullet points, including the trigger, ordered actions, decisions, result, side effects, errors, and fallbacks. Make every fallback, error route, state access, output, contract, configuration, and test change explicit.`;
 
   return `You are ChangeGraph, a language-agnostic code comprehension engine. Do not use or assume an AST, compiler, parser, LSP, or repository access. Analyze only the supplied text and deterministic line inventory.
 
@@ -181,12 +214,12 @@ Rules:
 4. Use short, concrete, outcome-oriented titles. Avoid vague labels such as "updated logic".
 5. Put unclear lines in an unknown node with low confidence instead of hiding them.
 6. Add directed edges only for concrete containment, flow, dependency, routing, configuration, fallback, or test relationships.
-7. Write each summary in plain, simple English using 2-4 short sentences, normally 45-100 words. Prefer direct subject-verb-object sentences. Define unavoidable project terms in place and avoid unexplained jargon or acronyms.
-8. A summary must answer: what starts this behavior, what happens step by step, what conditions change the path, and what result or side effect is produced. Explicitly state errors, fallbacks, state changes, and externally visible outputs when present.
+7. Write each summary as 4-7 ordered bullet points in plain, simple English, normally 60-140 words total. Encode the bullets inside the JSON string as newline-separated lines, and start every line with "- ". Each bullet must be a complete, direct subject-verb-object sentence, not a fragment.
+8. Preserve the whole behavioral explanation across the bullets. The points must answer what starts this behavior, what happens step by step, which decisions or branches alter the path, which collaborators or state participate, what result or side effect occurs, and what error or fallback applies. Omit only categories that truly do not exist. Define unavoidable project terms in place and avoid unexplained jargon or acronyms.
 9. Do not say code merely "handles", "manages", "processes", or "orchestrates" something. Name the concrete actions, conditions, collaborators, and outcomes instead.
-10. For change mode, write before and after as complete, specific plain-English descriptions of 20-70 words each. Make the behavioral difference understandable without reading the source. For baseline mode, keep both empty.
+10. For change mode, write before and after as 2-5 complete, specific bullet points each, using newline-separated "- " lines and 30-100 words per field. Keep points in execution order and make the behavioral difference understandable without reading the source. For baseline mode, keep both empty.
 11. Group related lines into 8-24 coherent behaviors rather than emitting one node per small syntax block. Do not combine unrelated functions only to reduce the node count.
-12. Keep titles under 8 words. Detail belongs in summary, before, and after; do not compress useful behavior into fragments.
+12. Keep titles under 8 words. Detail belongs in the bullet points in summary, before, and after; never drop useful behavior merely to shorten a card.
 13. Set codeIdentity to the exact function, method, class, component, route, heading, configuration section, or other named code boundary being explained. Include the filename when it improves clarity.
 14. Describe behavior rather than translating syntax line by line. A reader should understand why the code exists and what observable result it creates.
 15. Set provides to exact named interfaces this behavior exposes: functions, methods, classes, routes, events, commands, configuration keys, tables, queues, or stored data. Use names from the supplied code, not prose.

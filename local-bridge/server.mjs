@@ -10,7 +10,14 @@ const PARALLEL_WORKERS = Math.max(1, Number(process.env.CHANGEGRAPH_WORKERS || 4
 const INTEGRATION_WORKERS = Math.max(1, Number(process.env.CHANGEGRAPH_INTEGRATION_WORKERS || 3));
 const TARGET_BATCH_CHARACTERS = 64_000;
 const TARGET_BATCH_LINES = 900;
-const PROMPT_VERSION = "semantic-v7-end-to-end-architecture";
+const MAX_ANALYSIS_SPLIT_DEPTH = 2;
+const JOB_HEARTBEAT_MS = 10_000;
+const DEFAULT_CODEX_TIMEOUT_MS = 30 * 60 * 1_000;
+const configuredCodexTimeout = Number(process.env.CHANGEGRAPH_CODEX_TIMEOUT_MS || DEFAULT_CODEX_TIMEOUT_MS);
+const CODEX_REQUEST_TIMEOUT_MS = Number.isFinite(configuredCodexTimeout) && configuredCodexTimeout >= 60_000
+  ? configuredCodexTimeout
+  : DEFAULT_CODEX_TIMEOUT_MS;
+const PROMPT_VERSION = "semantic-v9-multi-axis-journeys";
 const CACHE_DIR = path.resolve(process.env.CHANGEGRAPH_CACHE_DIR || ".changegraph/cache");
 const jobs = new Map();
 const inFlight = new Map();
@@ -40,9 +47,9 @@ const ANALYSIS_SCHEMA = {
           title: { type: "string" },
           codeIdentity: { type: "string" },
           kind: { type: "string", enum: SEMANTIC_KINDS },
-          summary: { type: "string" },
-          before: { type: "string" },
-          after: { type: "string" },
+          summary: { type: "string", description: "Four to seven complete plain-English bullet points separated by newlines; every line starts with - " },
+          before: { type: "string", description: "For change analysis, two to five complete prior-behavior bullet points separated by newlines; empty for baseline" },
+          after: { type: "string", description: "For change analysis, two to five complete new-behavior bullet points separated by newlines; empty for baseline" },
           lineIds: { type: "array", items: { type: "string" } },
           confidence: { type: "string", enum: ["high", "medium", "low"] },
           provides: { type: "array", items: { type: "string" } },
@@ -73,9 +80,10 @@ const INTEGRATION_SCHEMA = {
   properties: { edges: ANALYSIS_SCHEMA.properties.edges },
 };
 
-const JOURNEY_PHASES = ["foundation", "identity", "exploration", "core-workflow", "background-work", "delivery", "recovery", "operations"];
-const JOURNEY_STAGES = ["entry", "validation", "core", "data", "external", "output", "async", "fallback", "error"];
-const JOURNEY_BRANCHES = ["main", "async", "fallback", "error"];
+const JOURNEY_PHASES = ["foundation", "queries", "commands", "automation", "recovery", "operations"];
+const JOURNEY_FLOW_ROLES = ["trigger", "guard", "orchestration", "computation", "side-effect", "result"];
+const JOURNEY_LANES = ["main", "async", "rejection", "retry", "fallback", "error", "compensation"];
+const JOURNEY_BOUNDARIES = ["frontend", "backend", "database", "cache", "queue", "object-storage", "filesystem", "internal-service", "external-api"];
 const JOURNEY_ORDER_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -86,10 +94,11 @@ const JOURNEY_ORDER_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["journeyId", "phase", "sequence", "rationale"],
+        required: ["journeyId", "phase", "capability", "sequence", "rationale"],
         properties: {
           journeyId: { type: "string" },
           phase: { type: "string", enum: JOURNEY_PHASES },
+          capability: { type: "string" },
           sequence: { type: "number" },
           rationale: { type: "string" },
         },
@@ -100,7 +109,7 @@ const JOURNEY_ORDER_SCHEMA = {
 const JOURNEY_STAGE_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["journeyId", "summary", "steps"],
+  required: ["journeyId", "summary", "steps", "resources", "excludedNodes"],
   properties: {
     journeyId: { type: "string" },
     summary: { type: "string" },
@@ -109,13 +118,40 @@ const JOURNEY_STAGE_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["nodeId", "stage", "branch", "sequence"],
+        required: ["nodeId", "flowRole", "lane", "sequence", "predecessorIds", "boundaryRefs", "confidence", "evidence"],
         properties: {
           nodeId: { type: "string" },
-          stage: { type: "string", enum: JOURNEY_STAGES },
-          branch: { type: "string", enum: JOURNEY_BRANCHES },
+          flowRole: { type: "string", enum: JOURNEY_FLOW_ROLES },
+          lane: { type: "string", enum: JOURNEY_LANES },
           sequence: { type: "number" },
+          predecessorIds: { type: "array", items: { type: "string" } },
+          boundaryRefs: { type: "array", items: { type: "string" } },
+          confidence: { type: "string", enum: ["high", "medium", "low"] },
+          evidence: { type: "string" },
         },
+      },
+    },
+    resources: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["resourceId", "name", "kind", "systemBoundary"],
+        properties: {
+          resourceId: { type: "string" },
+          name: { type: "string" },
+          kind: { type: "string", enum: JOURNEY_BOUNDARIES },
+          systemBoundary: { type: "string", enum: ["internal", "external"] },
+        },
+      },
+    },
+    excludedNodes: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["nodeId", "reason"],
+        properties: { nodeId: { type: "string" }, reason: { type: "string" } },
       },
     },
   },
@@ -163,7 +199,7 @@ function buildPrompt(body) {
   return `You are the semantic engine for ChangeGraph. Analyze only the supplied text. Do not edit files, run commands, inspect the repository, or use an AST, compiler, parser, or LSP.
 
 Return ONLY valid JSON:
-{"nodes":[{"id":"short-id","title":"short outcome-oriented behavior label","codeIdentity":"exact function, class, component, route, heading, or named section","kind":"structure|contract|flow|routing|error|fallback|state|output|config|test|unknown","summary":"2-4 plain-English sentences explaining the trigger, ordered actions, decisions, and result","before":"complete plain-English prior behavior or empty for baseline","after":"complete plain-English new behavior or empty for baseline","lineIds":["inventory-id"],"confidence":"high|medium|low","provides":["exact exposed symbol or interface"],"uses":["exact consumed symbol or interface"]}],"edges":[{"source":"node-id","target":"node-id","label":"SHORT RELATION"}]}
+{"nodes":[{"id":"short-id","title":"short outcome-oriented behavior label","codeIdentity":"exact function, class, component, route, heading, or named section","kind":"structure|contract|flow|routing|error|fallback|state|output|config|test|unknown","summary":"- Complete trigger point.\\n- Complete ordered action.\\n- Complete decision or state effect.\\n- Complete result or fallback.","before":"- Complete prior behavior point, or empty for baseline.","after":"- Complete new behavior point, or empty for baseline.","lineIds":["inventory-id"],"confidence":"high|medium|low","provides":["exact exposed symbol or interface"],"uses":["exact consumed symbol or interface"]}],"edges":[{"source":"node-id","target":"node-id","label":"SHORT RELATION"}]}
 
 Mode: ${mode}
 ${mode === "baseline" ? "Map how the existing code works for an engineer seeing this repository for the first time." : "Explain every exact before-to-after effect of the diff for an engineer seeing this change for the first time."}
@@ -173,13 +209,13 @@ Rules:
 - The [inventory-id] prefix is metadata, not source code.
 - Expose every fallback, error route, state access, output, contract, configuration, and test.
 - Put unclear lines in a visible unknown node with low confidence.
-- Write each summary in plain, simple English using 2-4 short sentences, normally 45-100 words. Prefer direct subject-verb-object sentences and explain unavoidable project terms.
-- Every summary must explain what starts the behavior, what happens step by step, which conditions change the path, and what result or side effect is produced.
+- Write each summary as 4-7 ordered bullet points in plain, simple English, normally 60-140 words total. Encode them as newline-separated lines inside the JSON string, starting every line with "- ". Every bullet must be a complete direct sentence, not a fragment.
+- Preserve the whole behavioral explanation across the bullets. The points must answer what starts this behavior, what happens step by step, which decisions or branches alter the path, which collaborators or state participate, what result or side effect occurs, and what error or fallback applies. Omit only categories that truly do not exist.
 - Explicitly name errors, fallbacks, state changes, external calls, stored data, and visible outputs when they exist.
 - Never say code merely "handles", "manages", "processes", or "orchestrates" something. Name the actual actions, conditions, collaborators, and outcomes.
-- In change mode, before and after must each be complete, specific plain-English descriptions of 20-70 words. In baseline mode, keep both empty.
+- In change mode, before and after must each contain 2-5 complete bullet points, encoded as newline-separated "- " lines and totaling 30-100 words per field. Keep them in execution order. In baseline mode, keep both empty.
 - Group related lines into 8-24 coherent behaviors rather than one node per syntax block. Do not combine unrelated functions only to reduce node count.
-- Keep titles under 8 words. Put useful detail in summary, before, and after instead of compressing it into fragments.
+- Keep titles under 8 words. Put complete detail in the bullet points in summary, before, and after; never drop useful behavior merely to shorten a card.
 - Set codeIdentity to the exact function, method, class, component, route, heading, configuration section, or other named code boundary being explained. Include the filename when it improves clarity.
 - Describe behavior rather than translating syntax line by line. The reader should understand why the code exists and what observable result it creates.
 - Set provides to exact named functions, methods, classes, routes, events, commands, configuration keys, tables, queues, or stored data this behavior exposes. Use names from the code, not prose.
@@ -232,19 +268,21 @@ ${JSON.stringify(body.nodes)}`;
 
 function buildJourneyOrderingPrompt(body) {
   if (body.orderingKind === "stages") {
-    return `You organize one already-discovered software journey for human reading. You may only classify and order supplied nodes; never invent, omit, merge, or duplicate nodes, and never create relationships.
+    return `You organize one already-discovered software journey for human reading. Separate runtime sequence, alternate control-flow lanes, and system boundaries instead of mixing them into one stage label.
 
 Return ONLY valid JSON:
-{"journeyId":"existing-journey-id","summary":"one short plain-English description of the reading path","steps":[{"nodeId":"existing-node-id","stage":"entry|validation|core|data|external|output|async|fallback|error","branch":"main|async|fallback|error","sequence":0}]}
+{"journeyId":"existing-journey-id","summary":"one short plain-English description of the reading path","steps":[{"nodeId":"existing-node-id","flowRole":"trigger|guard|orchestration|computation|side-effect|result","lane":"main|async|rejection|retry|fallback|error|compensation","sequence":0,"predecessorIds":["existing-node-id"],"boundaryRefs":["resource-id"],"confidence":"high|medium|low","evidence":"short observable reason"}],"resources":[{"resourceId":"stable-short-id","name":"concrete system or store name","kind":"frontend|backend|database|cache|queue|object-storage|filesystem|internal-service|external-api","systemBoundary":"internal|external"}],"excludedNodes":[{"nodeId":"existing-node-id","reason":"why this candidate is not part of this runtime behavior"}]}
 
 Rules:
-- Include every supplied node ID exactly once.
-- The main path should read from trigger to observable result.
-- Use entry for the trigger or receiving boundary, validation for checks and guards, core for decisions and transformations, data for persistence, external for outside services, and output for returned or visible results.
-- Put background work in async, alternative/retry behavior in fallback, and terminal failures in error.
-- Sequence is the recommended reading order across the whole journey. Respect supplied edge direction when it represents runtime control or information flow.
+- Put every supplied node ID in either steps or excludedNodes exactly once. Exclude a node only when the evidence shows it belongs to a different behavior and was pulled in by a shared dependency or discovery heuristic.
+- flowRole answers what the behavior does on the main runtime path: trigger starts it; guard admits or rejects it; orchestration coordinates calls and decisions; computation transforms or derives values; side-effect changes state, sends data, or invokes a boundary; result exposes the outcome.
+- lane is independent of flowRole. Use main for the normal path, async for detached work, rejection for expected guard refusal, retry for another attempt, fallback for an alternate path, error for unexpected failure, and compensation for rollback or cleanup.
+- Do not label a database, cache, queue, storage service, frontend, backend, or API as a stage. Add it once to resources and reference it from the relevant steps with boundaryRefs.
+- external means outside the analyzed repository or product boundary. A different file, module, frontend, or backend inside this repository is internal.
+- predecessorIds must contain only supplied node IDs with a supported direct runtime relationship. Do not infer a predecessor merely because two nodes share a resource.
+- Sequence is the recommended reading order across the whole journey. Respect supplied edge direction when it represents runtime control or information flow; order alternate lanes immediately after the main step that branches to them.
 - Keep unrelated branches separate. Do not treat a shared dependency as proof that two behaviors are one path.
-- The summary must describe observable software behavior, not your reasoning process.
+- confidence and evidence must communicate how directly the classification is supported without exposing hidden reasoning. The summary must describe observable software behavior.
 
 Journey:
 ${JSON.stringify(body.journey)}
@@ -258,11 +296,13 @@ ${JSON.stringify(body.edges)}`;
   return `You organize already-discovered end-to-end software journeys into the order an engineer should read them to understand the system. You may only order and categorize supplied journey IDs; never merge, omit, duplicate, or invent journeys.
 
 Return ONLY valid JSON:
-{"journeys":[{"journeyId":"existing-journey-id","phase":"foundation|identity|exploration|core-workflow|background-work|delivery|recovery|operations","sequence":0,"rationale":"one short plain-English reason this belongs here"}]}
+{"journeys":[{"journeyId":"existing-journey-id","phase":"foundation|queries|commands|automation|recovery|operations","capability":"short product-specific capability name","sequence":0,"rationale":"one short plain-English reason this belongs here"}]}
 
 Rules:
 - Include every supplied journey ID exactly once.
-- Create a coherent system narrative: foundation and startup, identity and access, read/exploration paths, core workflows, background work, delivery of results, recovery/failure handling, then operations/admin paths.
+- phase describes behavior shape, not product domain: foundation is startup/configuration; queries read without intending to change state; commands create or change state; automation is event, queue, worker, scheduled, or background work; recovery restores or compensates; operations covers administration, maintenance, and observability.
+- capability is the product-specific domain, such as Identity, Catalog, Billing, or Rendering. Do not use capability to decide phase: login may be a command and reading the current user may be a query even though both belong to Identity.
+- Order a coherent system narrative from prerequisites through user-facing queries and commands, follow-on automation, recovery paths, and operations.
 - Sequence journeys meaningfully within their phase using prerequisites, triggers, produced state, and observable outcomes.
 - Shared endpoints, databases, workers, or services do not make two journeys the same. Preserve every distinct behavior journey.
 - Do not claim relationships not present in the supplied contracts or behavior summaries.
@@ -296,7 +336,8 @@ async function callCodex(body) {
   const codex = new Codex();
   const thread = codex.startThread();
   const prompt = action === "integrate" ? buildIntegrationPrompt(body) : action === "order" ? buildJourneyOrderingPrompt(body) : buildPrompt(body);
-  const result = await withTimeout(thread.run(prompt), 75_000, "Codex local request timed out before completion");
+  const timeoutMinutes = Math.round(CODEX_REQUEST_TIMEOUT_MS / 60_000);
+  const result = await withTimeout(thread.run(prompt), CODEX_REQUEST_TIMEOUT_MS, `Codex local request timed out after ${timeoutMinutes} minutes`);
   const parsed = parseJsonResponse(result.finalResponse);
   return action === "order"
     ? { provider: "Codex SDK · local authentication", ordering: parsed }
@@ -383,7 +424,7 @@ function splitAnalysisPayload(body) {
   }).filter((part) => part.inventory.length && part[contentKey]);
 }
 
-async function analyze(body) {
+async function analyze(body, splitDepth = 0) {
   const key = cacheKeyFor(body);
   const cachePath = path.join(CACHE_DIR, `${key}.json`);
   const legacyPath = path.join(CACHE_DIR, `${cacheKeyFor(body, true)}.json`);
@@ -403,7 +444,7 @@ async function analyze(body) {
 
   const analyzeParts = async (parts) => {
     const results = [];
-    for (const part of parts) results.push(await analyze(part));
+    for (const part of parts) results.push(await analyze(part, splitDepth + 1));
     return {
       provider: results.map((result) => result.provider).find(Boolean) || "Codex SDK · local authentication",
       analysis: mergeAnalyses(results.map((result) => result.analysis)),
@@ -411,10 +452,11 @@ async function analyze(body) {
     };
   };
   const analysisContent = body.mode === "baseline" ? body.source : body.diff;
-  const proactiveParts = (body.action === "analyze" || !body.action) && (body.inventory?.length > 180 || String(analysisContent || "").length > 18_000) ? splitAnalysisPayload(body) : [];
+  const canSplit = splitDepth < MAX_ANALYSIS_SPLIT_DEPTH;
+  const proactiveParts = canSplit && (body.action === "analyze" || !body.action) && (body.inventory?.length > 180 || String(analysisContent || "").length > 18_000) ? splitAnalysisPayload(body) : [];
   const promise = (proactiveParts.length === 2 ? analyzeParts(proactiveParts) : callProviderWithRetry(body))
     .catch(async (error) => {
-      const parts = body.action === "analyze" || !body.action ? splitAnalysisPayload(body) : [];
+      const parts = canSplit && (body.action === "analyze" || !body.action) ? splitAnalysisPayload(body) : [];
       if (parts.length !== 2) throw error;
       return analyzeParts(parts);
     })
@@ -426,6 +468,21 @@ async function analyze(body) {
     .finally(() => inFlight.delete(key));
   inFlight.set(key, promise);
   return promise;
+}
+
+async function withJobHeartbeat(job, work) {
+  job.activeUnits += 1;
+  job.updatedAt = new Date().toISOString();
+  const timer = setInterval(() => {
+    job.updatedAt = new Date().toISOString();
+  }, JOB_HEARTBEAT_MS);
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+    job.activeUnits = Math.max(0, job.activeUnits - 1);
+    job.updatedAt = new Date().toISOString();
+  }
 }
 
 function isReadableRepositoryFile(filePath) {
@@ -770,6 +827,8 @@ function publicJob(job) {
     architectureConnected: job.architectureConnected,
     architectureGroups: job.architectureGroups,
     cached: job.cached,
+    activeUnits: job.activeUnits,
+    fresh: job.fresh,
     error: job.error,
     source: job.source,
     analysis,
@@ -792,8 +851,9 @@ async function runJob(job, batches) {
         source: job.mode === "baseline" ? batch.content : undefined,
         diff: job.mode === "change" ? batch.content : undefined,
         baselineContext: job.baselineContext,
+        cacheNonce: job.cacheNonce,
       };
-      const result = await analyze(payload);
+      const result = await withJobHeartbeat(job, () => analyze(payload));
       job.analyses[index] = result.analysis;
       job.providerName = result.provider;
       job.completed += 1;
@@ -816,14 +876,15 @@ async function runJob(job, batches) {
     if (windows.length) {
       job.status = "connecting";
       await runParallel(windows, INTEGRATION_WORKERS, async (window) => {
-        const result = await analyze({
+        const result = await withJobHeartbeat(job, () => analyze({
           action: "integrate",
           provider: job.provider,
           mode: job.mode,
           integrationKind: window.kind,
           integrationFocus: window.focus,
           nodes: window.nodes,
-        });
+          cacheNonce: job.cacheNonce,
+        }));
         job.crossEdges.push(...(result.analysis.edges || []));
         job.connected += 1;
         if (window.kind === "architecture") job.architectureConnected += 1;
@@ -855,6 +916,7 @@ async function createJob(body) {
   const batches = buildBatches(inventory);
   const id = randomUUID();
   const now = new Date().toISOString();
+  const fresh = body.fresh === true;
   const job = {
     id,
     status: "queued",
@@ -872,6 +934,9 @@ async function createJob(body) {
     architectureGroups: 0,
     architectureConnected: 0,
     cached: 0,
+    activeUnits: 0,
+    fresh,
+    cacheNonce: fresh ? id : undefined,
     analyses: new Array(batches.length),
     crossEdges: [],
     error: null,
@@ -903,6 +968,7 @@ const server = createServer(async (request, response) => {
       service: "changegraph-local-service",
       provider: "Codex SDK - local authentication",
       parallelWorkers: PARALLEL_WORKERS,
+      requestTimeoutMinutes: Math.round(CODEX_REQUEST_TIMEOUT_MS / 60_000),
       cache: CACHE_DIR,
       activeJobs: [...jobs.values()].filter((job) => ["queued", "analyzing", "connecting"].includes(job.status)).length,
     }, headers);

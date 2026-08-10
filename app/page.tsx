@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import Editor, { DiffEditor, loader, type DiffOnMount, type OnMount } from "@monaco-editor/react";
 import {
   Activity,
@@ -15,11 +15,12 @@ import {
   FolderTree,
   GitCompareArrows,
   LayoutDashboard,
-  Maximize2,
+  ListFilter,
   Network,
   PanelBottomClose,
   PanelRightClose,
   PanelRightOpen,
+  RotateCcw,
   Workflow,
   X,
 } from "lucide-react";
@@ -50,9 +51,11 @@ type MobilePanel = "input" | "graph" | "inspect";
 type GraphMode = "structure" | "behavior";
 type GraphZoomMode = "overview" | "standard" | "detail";
 type Confidence = "high" | "medium" | "low";
-type JourneyPhase = "foundation" | "identity" | "exploration" | "core-workflow" | "background-work" | "delivery" | "recovery" | "operations";
-type JourneyStage = "entry" | "validation" | "core" | "data" | "external" | "output" | "async" | "fallback" | "error";
-type JourneyBranch = "main" | "async" | "fallback" | "error";
+type JourneyPhase = "foundation" | "queries" | "commands" | "automation" | "recovery" | "operations";
+type JourneyFlowRole = "trigger" | "guard" | "orchestration" | "computation" | "side-effect" | "result";
+type JourneyLane = "main" | "async" | "rejection" | "retry" | "fallback" | "error" | "compensation";
+type JourneySection = JourneyFlowRole | Exclude<JourneyLane, "main">;
+type JourneyBoundaryKind = "frontend" | "backend" | "database" | "cache" | "queue" | "object-storage" | "filesystem" | "internal-service" | "external-api";
 type SemanticKind =
   | "structure"
   | "contract"
@@ -156,7 +159,7 @@ type FileContainerNodeData = Record<string, unknown> & {
 type FileContainerNode = Node<FileContainerNodeData, "fileContainer">;
 
 type JourneyStageNodeData = Record<string, unknown> & {
-  stage: JourneyStage;
+  stage: JourneySection;
   title: string;
   description: string;
   count: number;
@@ -258,8 +261,8 @@ const TARGET_BATCH_LINES = 900;
 const PARALLEL_ANALYSIS_WORKERS = 4;
 const PARALLEL_INTEGRATION_WORKERS = 3;
 const ANALYSIS_CACHE = "changegraph-analysis-v2";
-const PROMPT_VERSION = "semantic-v7-end-to-end-architecture";
-const JOURNEY_ORDERING_VERSION = "journey-reading-order-v1";
+const PROMPT_VERSION = "semantic-v9-multi-axis-journeys";
+const JOURNEY_ORDERING_VERSION = "journey-reading-order-v2-multi-axis";
 
 async function localBridgeIsReady() {
   const controller = new AbortController();
@@ -896,8 +899,8 @@ function makeEdge(source: string, target: string, label: string, color = "#23AFD
     label,
     type: "graph",
     markerEnd: { type: MarkerType.ArrowClosed, color },
-    style: { stroke: color, strokeWidth: 1.5 },
-    labelStyle: { fill: "#CCCCCC", fontSize: 10, fontWeight: 700 },
+    style: { stroke: color, strokeWidth: 1.2 },
+    labelStyle: { fill: "#CCCCCC", fontSize: 9, fontWeight: 650 },
     labelBgStyle: { fill: "#252526", fillOpacity: 0.96 },
   };
 }
@@ -958,6 +961,24 @@ function primaryFileForNode(node: SemanticNode) {
     counts.set(file, (counts.get(file) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? "unknown";
+}
+
+function compactFileLabel(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+const NO_EXTENSION_KEY = "__no_extension__";
+
+function fileExtensionKey(path: string) {
+  const name = compactFileLabel(path).toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot > 0 && dot < name.length - 1) return name.slice(dot);
+  if (dot === 0 && name.indexOf(".", 1) < 0) return name;
+  return NO_EXTENSION_KEY;
+}
+
+function fileExtensionLabel(extension: string) {
+  return extension === NO_EXTENSION_KEY ? "No extension" : extension;
 }
 
 function buildFileGroups(nodes: SemanticNode[]) {
@@ -1045,6 +1066,7 @@ type SystemJourney = {
 type JourneyOrderItem = {
   journeyId: string;
   phase: JourneyPhase;
+  capability: string;
   sequence: number;
   rationale: string;
 };
@@ -1055,71 +1077,110 @@ type JourneyOrderPlan = {
 
 type JourneyStageStep = {
   nodeId: string;
-  stage: JourneyStage;
-  branch: JourneyBranch;
+  flowRole: JourneyFlowRole;
+  lane: JourneyLane;
   sequence: number;
+  predecessorIds: string[];
+  boundaryRefs: string[];
+  confidence: Confidence;
+  evidence: string;
 };
+
+type JourneyResource = {
+  resourceId: string;
+  name: string;
+  kind: JourneyBoundaryKind;
+  systemBoundary: "internal" | "external";
+};
+
+type JourneyExcludedNode = { nodeId: string; reason: string };
 
 type JourneyStagePlan = {
   journeyId: string;
   summary: string;
   steps: JourneyStageStep[];
+  resources: JourneyResource[];
+  excludedNodes: JourneyExcludedNode[];
 };
 
-const JOURNEY_PHASE_ORDER: JourneyPhase[] = ["foundation", "identity", "exploration", "core-workflow", "background-work", "delivery", "recovery", "operations"];
-const JOURNEY_STAGE_ORDER: JourneyStage[] = ["entry", "validation", "core", "data", "external", "output", "async", "fallback", "error"];
-const JOURNEY_STAGE_COPY: Record<JourneyStage, { title: string; description: string }> = {
-  entry: { title: "Entry", description: "Where this behavior starts" },
-  validation: { title: "Validation", description: "Checks that allow or reject the request" },
-  core: { title: "Core processing", description: "The main decisions and transformations" },
-  data: { title: "Data and storage", description: "Reads, writes, and persisted state" },
-  external: { title: "External systems", description: "Services and boundaries outside this module" },
-  output: { title: "Result", description: "What the journey returns or exposes" },
-  async: { title: "Async work", description: "Work that continues outside the direct response" },
-  fallback: { title: "Fallback and retry", description: "Alternative behavior when the main path cannot continue" },
-  error: { title: "Errors", description: "Failures that stop or reject the journey" },
+const JOURNEY_PHASE_ORDER: JourneyPhase[] = ["foundation", "queries", "commands", "automation", "recovery", "operations"];
+const JOURNEY_FLOW_ROLE_ORDER: JourneyFlowRole[] = ["trigger", "guard", "orchestration", "computation", "side-effect", "result"];
+const JOURNEY_LANE_ORDER: JourneyLane[] = ["main", "async", "rejection", "retry", "fallback", "error", "compensation"];
+const JOURNEY_SECTION_ORDER: JourneySection[] = [...JOURNEY_FLOW_ROLE_ORDER, ...JOURNEY_LANE_ORDER.filter((lane): lane is Exclude<JourneyLane, "main"> => lane !== "main")];
+const JOURNEY_STAGE_COPY: Record<JourneySection, { title: string; description: string }> = {
+  trigger: { title: "Trigger", description: "The request, event, or action that starts this journey" },
+  guard: { title: "Guards", description: "Checks that decide whether the main path may continue" },
+  orchestration: { title: "Coordination", description: "Calls and decisions that coordinate the journey" },
+  computation: { title: "Core logic", description: "Calculations and transformations performed by the system" },
+  "side-effect": { title: "State and effects", description: "Writes, calls, messages, and other observable effects" },
+  result: { title: "Result", description: "The value, response, or state exposed at the end" },
+  async: { title: "Async lane", description: "Work that continues outside the direct response" },
+  rejection: { title: "Rejected path", description: "Expected validation or authorization refusals" },
+  retry: { title: "Retry lane", description: "A repeated attempt after a recoverable failure" },
+  fallback: { title: "Fallback lane", description: "A different behavior used when the primary path cannot continue" },
+  error: { title: "Error lane", description: "Unexpected failures that stop the journey" },
+  compensation: { title: "Compensation", description: "Cleanup or rollback that reverses a partial effect" },
 };
 
 function defaultJourneyPhase(journey: SystemJourney): JourneyPhase {
   const text = `${journey.title} ${journey.description} ${journey.contracts.join(" ")}`.toLowerCase();
-  if (/health|startup|config|bootstrap|migration/.test(text)) return "foundation";
-  if (/auth|login|session|token|permission|user/.test(text)) return "identity";
-  if (/get|read|list|search|catalog|browse|status/.test(text)) return "exploration";
-  if (/queue|event|worker|background|websocket|stream/.test(text)) return "background-work";
-  if (/result|download|notify|response|delivery|export/.test(text)) return "delivery";
-  if (/cancel|retry|fallback|error|fail|delete/.test(text)) return "recovery";
-  if (/admin|metric|audit|monitor|operation/.test(text)) return "operations";
-  return "core-workflow";
+  if (/\b(health|startup|config|bootstrap|migration|seed|initialize)\b/.test(text)) return "foundation";
+  if (/\b(queue|event|worker|background|websocket|stream|schedule|cron|consume|subscriber)\b/.test(text)) return "automation";
+  if (/\b(cancel|retry|fallback|recover|rollback|compensat|dead.?letter)\b/.test(text)) return "recovery";
+  if (/\b(admin|metric|audit|monitor|maintenance|operation|diagnostic)\b/.test(text)) return "operations";
+  if (/\b(http\s+(get|head)|read|list|search|browse|lookup|fetch|status|query)\b/.test(text)) return "queries";
+  return "commands";
 }
 
-function defaultJourneyStage(node: SemanticNode): JourneyStage {
+function defaultJourneyLane(node: SemanticNode): JourneyLane {
   const text = `${node.data.title} ${node.data.codeIdentity || ""} ${node.data.summary} ${(node.data.provides ?? []).join(" ")} ${(node.data.uses ?? []).join(" ")}`.toLowerCase();
-  if (node.data.kind === "error" || /\b(error|exception|reject|invalid|unauthorized|forbidden)\b/.test(text)) return "error";
-  if (node.data.kind === "fallback" || /\b(fallback|retry|degrade|default)\b/.test(text)) return "fallback";
-  if (/\b(queue|event|worker|background|async|websocket|publish|consume)\b/.test(text)) return "async";
-  if (/\b(database| db |sql|repository|persist|store|cache|transaction|model)\b/.test(` ${text} `) || node.data.kind === "state") return "data";
-  if (/\b(http|external|provider|client|third.party|object store|s3|r2)\b/.test(text)) return "external";
-  if (node.data.kind === "output" || /\b(return|response|result|render|emit|display|download)\b/.test(text)) return "output";
-  if (/\b(validate|verify|authorize|authenticate|permission|guard|check)\b/.test(text)) return "validation";
-  if (node.data.kind === "routing" || node.data.kind === "contract" || /\b(route|endpoint|trigger|request|command|entry)\b/.test(text)) return "entry";
-  return "core";
+  if (/\b(rollback|undo|compensat|cleanup partial|revert effect)\b/.test(text)) return "compensation";
+  if (/\b(retry|backoff|requeue|attempt again)\b/.test(text)) return "retry";
+  if (node.data.kind === "fallback" || /\b(fallback|degrade|alternate provider|safe default)\b/.test(text)) return "fallback";
+  if (/\b(queue|event|worker|background|async|websocket|publish|consume|schedule|cron)\b/.test(text)) return "async";
+  if (/\b(invalid|unauthorized|forbidden|reject|denied|validation fail|guard fail)\b/.test(text)) return "rejection";
+  if (node.data.kind === "error" || /\b(exception|unhandled|crash|panic|fatal|internal error|500)\b/.test(text)) return "error";
+  return "main";
 }
 
-function defaultJourneyBranch(stage: JourneyStage): JourneyBranch {
-  return stage === "async" || stage === "fallback" || stage === "error" ? stage : "main";
+function defaultJourneyFlowRole(node: SemanticNode): JourneyFlowRole {
+  const text = `${node.data.title} ${node.data.codeIdentity || ""} ${node.data.summary} ${(node.data.provides ?? []).join(" ")} ${(node.data.uses ?? []).join(" ")}`.toLowerCase();
+  if (/\b(validate|verify|authorize|authenticate|permission|guard|precondition|check)\b/.test(text)) return "guard";
+  if (node.data.kind === "routing" || node.data.kind === "contract" || /\b(route|endpoint|trigger|receives? request|command handler|event consumer|entry point)\b/.test(text)) return "trigger";
+  if (node.data.kind === "output" || /\b(return|response|result|render|display|download|expose|redirect)\b/.test(text)) return "result";
+  if (node.data.kind === "state" || /\b(write|save|persist|delete|update|publish|emit|send|upload|database|repository|object store|cache|external api)\b/.test(text)) return "side-effect";
+  if (node.data.kind === "flow" || /\b(orchestrat|coordinate|dispatch|delegate|select provider|call service|workflow)\b/.test(text)) return "orchestration";
+  return "computation";
+}
+
+function journeySection(step: JourneyStageStep): JourneySection {
+  return step.lane === "main" ? step.flowRole : step.lane;
 }
 
 function fallbackJourneyStagePlan(journey: SystemJourney, analysis: AnalysisResult): JourneyStagePlan {
   const ids = new Set(journey.nodeIds);
   const nodes = analysis.nodes.filter((node) => ids.has(node.id));
-  const rankOrder = new Map(rankBehaviorGraph(nodes, analysis.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)), 12).flat().map((node, index) => [node.id, index]));
+  const relevantEdges = analysis.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target));
+  const rankOrder = new Map(rankBehaviorGraph(nodes, relevantEdges, 12).flat().map((node, index) => [node.id, index]));
+  const predecessors = new Map<string, string[]>();
+  relevantEdges.forEach((edge) => predecessors.set(edge.target, [...(predecessors.get(edge.target) ?? []), edge.source]));
   return {
     journeyId: journey.id,
-    summary: "Stages inferred from the mapped behavior and its existing connections.",
+    summary: "Reading order inferred from the mapped behavior and its existing connections.",
     steps: nodes.map((node, index) => {
-      const stage = defaultJourneyStage(node);
-      return { nodeId: node.id, stage, branch: defaultJourneyBranch(stage), sequence: rankOrder.get(node.id) ?? index };
+      return {
+        nodeId: node.id,
+        flowRole: defaultJourneyFlowRole(node),
+        lane: defaultJourneyLane(node),
+        sequence: rankOrder.get(node.id) ?? index,
+        predecessorIds: predecessors.get(node.id) ?? [],
+        boundaryRefs: [],
+        confidence: "medium" as const,
+        evidence: "Inferred from the behavior kind, contracts, and directed graph edges.",
+      };
     }).sort((left, right) => left.sequence - right.sequence),
+    resources: [],
+    excludedNodes: [],
   };
 }
 
@@ -1136,10 +1197,16 @@ function validateJourneyOrderPlan(value: unknown, journeys: SystemJourney[]): Jo
     seen.add(candidate.journeyId);
     const journey = byId.get(candidate.journeyId)!;
     const phase = JOURNEY_PHASE_ORDER.includes(candidate.phase as JourneyPhase) ? candidate.phase as JourneyPhase : defaultJourneyPhase(journey);
-    return [{ journeyId: candidate.journeyId, phase, sequence: Number.isFinite(candidate.sequence) ? Number(candidate.sequence) : index, rationale: String(candidate.rationale || "Placed from its trigger and system outcome.") }];
+    return [{
+      journeyId: candidate.journeyId,
+      phase,
+      capability: String(candidate.capability || journey.title || "System behavior"),
+      sequence: Number.isFinite(candidate.sequence) ? Number(candidate.sequence) : index,
+      rationale: String(candidate.rationale || "Placed from its trigger and system outcome."),
+    }];
   });
   journeys.forEach((journey, index) => {
-    if (!seen.has(journey.id)) valid.push({ journeyId: journey.id, phase: defaultJourneyPhase(journey), sequence: raw.length + index, rationale: "Placed deterministically because the AI ordering omitted this journey." });
+    if (!seen.has(journey.id)) valid.push({ journeyId: journey.id, phase: defaultJourneyPhase(journey), capability: journey.title, sequence: raw.length + index, rationale: "Placed deterministically because the AI ordering omitted this journey." });
   });
   return { journeys: valid };
 }
@@ -1147,22 +1214,66 @@ function validateJourneyOrderPlan(value: unknown, journeys: SystemJourney[]): Jo
 function validateJourneyStagePlan(value: unknown, journey: SystemJourney, analysis: AnalysisResult): JourneyStagePlan {
   const fallback = fallbackJourneyStagePlan(journey, analysis);
   if (!value || typeof value !== "object") return fallback;
-  const candidate = value as { journeyId?: unknown; summary?: unknown; steps?: unknown[] };
+  const candidate = value as { journeyId?: unknown; summary?: unknown; steps?: unknown[]; resources?: unknown[]; excludedNodes?: unknown[] };
   if (candidate.journeyId !== journey.id || !Array.isArray(candidate.steps)) return fallback;
   const allowed = new Set(journey.nodeIds);
+  const resources = (Array.isArray(candidate.resources) ? candidate.resources : []).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const resource = item as Partial<JourneyResource>;
+    const boundaryKinds: JourneyBoundaryKind[] = ["frontend", "backend", "database", "cache", "queue", "object-storage", "filesystem", "internal-service", "external-api"];
+    if (!resource.resourceId || !resource.name || !boundaryKinds.includes(resource.kind as JourneyBoundaryKind)) return [];
+    return [{
+      resourceId: String(resource.resourceId),
+      name: String(resource.name),
+      kind: resource.kind as JourneyBoundaryKind,
+      systemBoundary: resource.systemBoundary === "external" ? "external" as const : "internal" as const,
+    }];
+  });
+  const resourceIds = new Set(resources.map((resource) => resource.resourceId));
+  const excludedNodes = (Array.isArray(candidate.excludedNodes) ? candidate.excludedNodes : []).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const excluded = item as Partial<JourneyExcludedNode>;
+    // The journey anchor is the behavior the user explicitly opened. It must
+    // always remain visible, even when an ordering response tries to classify
+    // it as contextual rather than executable.
+    if (!excluded.nodeId || !allowed.has(excluded.nodeId) || excluded.nodeId === journey.anchorId) return [];
+    return [{ nodeId: excluded.nodeId, reason: String(excluded.reason || "Not part of this runtime path.") }];
+  });
+  const excludedIds = new Set(excludedNodes.map((item) => item.nodeId));
   const seen = new Set<string>();
   const steps = candidate.steps.flatMap((item, index) => {
     if (!item || typeof item !== "object") return [];
-    const step = item as Partial<JourneyStageStep>;
+    const step = item as Partial<JourneyStageStep> & { stage?: string; branch?: string };
     if (!step.nodeId || !allowed.has(step.nodeId) || seen.has(step.nodeId)) return [];
     seen.add(step.nodeId);
     const node = analysis.nodes.find((current) => current.id === step.nodeId);
-    const stage = JOURNEY_STAGE_ORDER.includes(step.stage as JourneyStage) ? step.stage as JourneyStage : node ? defaultJourneyStage(node) : "core";
-    const branch = (["main", "async", "fallback", "error"] as JourneyBranch[]).includes(step.branch as JourneyBranch) ? step.branch as JourneyBranch : defaultJourneyBranch(stage);
-    return [{ nodeId: step.nodeId, stage, branch, sequence: Number.isFinite(step.sequence) ? Number(step.sequence) : index }];
+    const legacyFlowRoles: Record<string, JourneyFlowRole> = { entry: "trigger", validation: "guard", core: "computation", data: "side-effect", external: "side-effect", output: "result", async: "orchestration", fallback: "orchestration", error: "orchestration" };
+    const legacyLanes: Record<string, JourneyLane> = { async: "async", fallback: "fallback", error: "error" };
+    const flowRole = JOURNEY_FLOW_ROLE_ORDER.includes(step.flowRole as JourneyFlowRole)
+      ? step.flowRole as JourneyFlowRole
+      : legacyFlowRoles[String(step.stage || "")] ?? (node ? defaultJourneyFlowRole(node) : "computation");
+    const lane = JOURNEY_LANE_ORDER.includes(step.lane as JourneyLane)
+      ? step.lane as JourneyLane
+      : legacyLanes[String(step.branch || step.stage || "")] ?? (node ? defaultJourneyLane(node) : "main");
+    return [{
+      nodeId: step.nodeId,
+      flowRole,
+      lane,
+      sequence: Number.isFinite(step.sequence) ? Number(step.sequence) : index,
+      predecessorIds: Array.isArray(step.predecessorIds) ? step.predecessorIds.filter((id): id is string => typeof id === "string" && allowed.has(id)) : [],
+      boundaryRefs: Array.isArray(step.boundaryRefs) ? step.boundaryRefs.filter((id): id is string => typeof id === "string" && resourceIds.has(id)) : [],
+      confidence: (["high", "medium", "low"] as Confidence[]).includes(step.confidence as Confidence) ? step.confidence as Confidence : "medium",
+      evidence: String(step.evidence || "Classified from the supplied behavior and graph evidence."),
+    }];
   });
-  fallback.steps.forEach((step) => { if (!seen.has(step.nodeId)) steps.push({ ...step, sequence: steps.length + step.sequence }); });
-  return { journeyId: journey.id, summary: String(candidate.summary || fallback.summary), steps: steps.sort((left, right) => left.sequence - right.sequence) };
+  fallback.steps.forEach((step) => { if (!seen.has(step.nodeId) && !excludedIds.has(step.nodeId)) steps.push({ ...step, sequence: steps.length + step.sequence }); });
+  return {
+    journeyId: journey.id,
+    summary: String(candidate.summary || fallback.summary),
+    steps: steps.sort((left, right) => left.sequence - right.sequence),
+    resources,
+    excludedNodes,
+  };
 }
 
 function rankBehaviorGraph(nodes: SemanticNode[], edges: Edge[], maxRank = 4) {
@@ -1392,15 +1503,129 @@ function orderedJourneysFromPlan(journeys: SystemJourney[], plan: JourneyOrderPl
 function journeyPhaseLabel(phase: JourneyPhase) {
   const labels: Record<JourneyPhase, string> = {
     foundation: "Foundation and startup",
-    identity: "Identity and access",
-    exploration: "Read and exploration",
-    "core-workflow": "Core workflows",
-    "background-work": "Background processing",
-    delivery: "Results and delivery",
+    queries: "Queries and exploration",
+    commands: "Commands and workflows",
+    automation: "Automation and background work",
     recovery: "Recovery and failure handling",
     operations: "Operations and administration",
   };
   return labels[phase];
+}
+
+function JourneyPicker({
+  groups,
+  activeJourneyId,
+  onSelect,
+}: {
+  groups: Array<{ phase: JourneyPhase; journeys: SystemJourney[] }>;
+  activeJourneyId?: string;
+  onSelect(journeyId: string): void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const listboxId = useId();
+  const journeys = useMemo(() => groups.flatMap((group) => group.journeys), [groups]);
+  const journeyIndexById = useMemo(() => new Map(journeys.map((journey, index) => [journey.id, index])), [journeys]);
+  const activeIndex = activeJourneyId ? journeyIndexById.get(activeJourneyId) ?? -1 : -1;
+  const activeJourney = activeIndex >= 0 ? journeys[activeIndex] : undefined;
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => optionRefs.current[Math.max(0, activeIndex)]?.focus());
+    const closeFromOutside = (event: PointerEvent) => {
+      const root = rootRef.current;
+      if (root && event.target instanceof window.Node && !root.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeFromOutside);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("pointerdown", closeFromOutside);
+    };
+  }, [activeIndex, open]);
+
+  const choose = (journeyId: string) => {
+    onSelect(journeyId);
+    setOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+
+  return (
+    <div ref={rootRef} className={`journey-picker ${open ? "is-open" : ""}`}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="journey-picker-trigger"
+        aria-label="Jump to a complete journey"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={listboxId}
+        onClick={() => setOpen((current) => !current)}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
+        <span>{activeJourney ? `${activeIndex + 1}. ${activeJourney.title} — ${activeJourney.description}` : "Choose an end-to-end journey…"}</span>
+        <ChevronDown aria-hidden="true" />
+      </button>
+      {open ? (
+        <div
+          id={listboxId}
+          className="journey-picker-menu"
+          role="listbox"
+          tabIndex={-1}
+          aria-label="End-to-end system journeys"
+          onKeyDown={(event) => {
+            const currentIndex = optionRefs.current.findIndex((option) => option === document.activeElement);
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setOpen(false);
+              triggerRef.current?.focus();
+              return;
+            }
+            const nextIndex = event.key === "Home" ? 0
+              : event.key === "End" ? journeys.length - 1
+                : event.key === "ArrowDown" ? Math.min(journeys.length - 1, currentIndex + 1)
+                  : event.key === "ArrowUp" ? Math.max(0, currentIndex - 1)
+                    : -1;
+            if (nextIndex >= 0) {
+              event.preventDefault();
+              optionRefs.current[nextIndex]?.focus();
+            }
+          }}
+        >
+          {groups.map((group) => (
+            <section key={group.phase} className="journey-picker-group" role="group" aria-label={journeyPhaseLabel(group.phase)}>
+              <header>{journeyPhaseLabel(group.phase)}</header>
+              {group.journeys.map((journey) => {
+                const index = journeyIndexById.get(journey.id) ?? 0;
+                const selected = journey.id === activeJourneyId;
+                return (
+                  <button
+                    key={journey.id}
+                    ref={(element) => { optionRefs.current[index] = element; }}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    className={selected ? "active" : ""}
+                    tabIndex={selected || (!activeJourneyId && index === 0) ? 0 : -1}
+                    onClick={() => choose(journey.id)}
+                  >
+                    <span>{index + 1}</span>
+                    <div><strong>{journey.title}</strong><small>{journey.description}</small></div>
+                  </button>
+                );
+              })}
+            </section>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function journeyOrderingContext(journeys: SystemJourney[], analysis: AnalysisResult, ownership: Map<string, BehaviorOwnership>) {
@@ -1448,26 +1673,26 @@ function describeBehaviorKinds(nodes: SemanticNode[]) {
   return labels.length ? `${labels.join(" · ")} behavior` : "Code structure and ownership";
 }
 
-function centeredY(index: number, count: number, center: number, gap = 420) {
+function centeredY(index: number, count: number, center: number, gap = 320) {
   return center + (index - (count - 1) / 2) * gap;
 }
 
-const BEHAVIOR_CARD_WIDTH = 540;
-const FILE_GROUP_PADDING = 68;
-const FILE_GROUP_HEADER = 234;
-const BEHAVIOR_COLUMN_GAP = 72;
-const BEHAVIOR_ROW_GAP = 84;
+const BEHAVIOR_CARD_WIDTH = 420;
+const FILE_GROUP_PADDING = 48;
+const FILE_GROUP_HEADER = 190;
+const BEHAVIOR_COLUMN_GAP = 56;
+const BEHAVIOR_ROW_GAP = 64;
 
 function estimatedBehaviorHeight(node: SemanticNode, expanded: boolean) {
-  if (!expanded) return 220;
+  if (!expanded) return 170;
   const identityLength = `${node.data.codeIdentity || ""} ${node.data.title}`.length;
-  const headerLines = Math.max(2, Math.ceil(identityLength / 44));
-  const headerHeight = 142 + Math.max(0, headerLines - 2) * 34;
+  const headerLines = Math.max(2, Math.ceil(identityLength / 48));
+  const headerHeight = 108 + Math.max(0, headerLines - 2) * 26;
   const bodyLines = node.data.stage === "baseline"
     ? Math.max(2, Math.ceil(node.data.summary.length / 40))
-    : Math.max(2, Math.ceil(node.data.before.length / 28), Math.ceil(node.data.after.length / 28));
-  const bodyHeight = Math.max(node.data.stage === "baseline" ? 122 : 144, 66 + bodyLines * 35);
-  return Math.min(1400, headerHeight + bodyHeight + 86);
+    : Math.max(2, Math.ceil(node.data.before.length / 34), Math.ceil(node.data.after.length / 34));
+  const bodyHeight = Math.max(node.data.stage === "baseline" ? 100 : 116, 46 + bodyLines * 25);
+  return Math.min(980, headerHeight + bodyHeight + 54);
 }
 
 function arrangeHldRanks(ranks: SemanticNode[][], edges: Edge[], expanded: boolean) {
@@ -1481,9 +1706,9 @@ function arrangeHldRanks(ranks: SemanticNode[][], edges: Edge[], expanded: boole
     outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge.target]);
   });
   const positions = new Map<string, { x: number; y: number }>();
-  const columnGap = expanded ? 920 : 820;
-  const rowGap = expanded ? 190 : 150;
-  const heightOf = (node: SemanticNode) => estimatedBehaviorHeight(node, expanded) + 76;
+  const columnGap = expanded ? 720 : 640;
+  const rowGap = expanded ? 120 : 96;
+  const heightOf = (node: SemanticNode) => estimatedBehaviorHeight(node, expanded) + 52;
   const centerOf = (id: string) => {
     const node = nodeById.get(id);
     const position = positions.get(id);
@@ -1515,7 +1740,7 @@ function arrangeHldRanks(ranks: SemanticNode[][], edges: Edge[], expanded: boole
     for (let rankIndex = ranks.length - 2; rankIndex >= 0; rankIndex -= 1) placeRank(ranks[rankIndex], rankIndex, "outgoing");
   }
   const minY = Math.min(0, ...positions.values().map((position) => position.y));
-  const shift = 160 - minY;
+  const shift = 112 - minY;
   positions.forEach((position, id) => positions.set(id, { x: position.x, y: position.y + shift }));
   return positions;
 }
@@ -1524,7 +1749,7 @@ function fileContainerLayout(behaviors: SemanticNode[], columns: number, expande
   const actualColumns = Math.max(1, Math.min(columns, behaviors.length || 1));
   const rows = Math.max(1, Math.ceil(behaviors.length / actualColumns));
   const rowHeights = Array.from({ length: rows }, (_, row) => Math.max(
-    250,
+    190,
     ...behaviors.slice(row * actualColumns, (row + 1) * actualColumns).map((node) => estimatedBehaviorHeight(node, expandAll || node.id === expandedId)),
   ));
   const rowOffsets: number[] = [];
@@ -1749,7 +1974,7 @@ function layoutExpandedGraph(
     nodes.push({
       id: group.id,
       type: "subsystem",
-      position: { x: 780, y },
+      position: { x: 640, y },
       data: { structureId: group.id, level: "subsystem", title: group.title, path: group.path, summary: "Subsystem", conceptCount: group.nodes.length, fileCount: group.files.length, lineCount: group.lineCount, kinds: group.kinds, behavior: describeBehaviorKinds(group.nodes), revealIndex: index },
     });
     graphEdges.push(structureEdge(rootId, group.id, "#8E85FF"));
@@ -1764,7 +1989,7 @@ function layoutExpandedGraph(
     nodes.push({
       id: module.id,
       type: "subsystem",
-      position: { x: 1560, y },
+      position: { x: 1280, y },
       data: { structureId: module.id, level: "module", title: module.title, path: module.path, summary: "Project folder", conceptCount: module.nodes.length, fileCount: module.files.length, lineCount: module.lineCount, kinds: module.kinds, behavior: describeBehaviorKinds(module.nodes), revealIndex: index },
     });
     graphEdges.push(structureEdge(selectedSubsystem.id, module.id, "#23AFD0"));
@@ -1778,7 +2003,7 @@ function layoutExpandedGraph(
       nodes.push({
         id: file.id,
         type: "subsystem",
-        position: { x: 2340, y },
+        position: { x: 1920, y },
         data: { structureId: file.id, level: "file", title: file.title, path: file.path, summary: "Source file", conceptCount: file.nodes.length, fileCount: 1, lineCount: file.lineCount, kinds: file.kinds, behavior: describeBehaviorKinds(file.nodes), revealIndex: index },
       });
       graphEdges.push(structureEdge(selectedModule.id, file.id, "#29A383"));
@@ -1796,7 +2021,7 @@ function layoutExpandedGraph(
     ? analysis.edges.filter((edge) => edge.source === selectedBehavior.id || edge.target === selectedBehavior.id)
     : [];
   const internalRelatedIds = new Set(directEdges.flatMap((edge) => [edge.source, edge.target]).filter((id) => id !== selectedBehavior?.id && behaviorIds.has(id)));
-  const primaryPosition = { x: directEdges.length ? 3300 : 2340, y: selectedModuleY - 72 };
+  const primaryPosition = { x: directEdges.length ? 2700 : 1920, y: selectedModuleY - 56 };
 
   nodes.push({
     id: selectedFile.id,
@@ -1860,7 +2085,7 @@ function layoutExpandedGraph(
         const relatedNodes = [...group.nodes.values()].sort((a, b) => a.data.title.localeCompare(b.data.title));
         return { ...group, relatedNodes, size: fileContainerLayout(relatedNodes, 1, undefined, true) };
       });
-    const relatedGap = 260;
+    const relatedGap = 180;
     const selectedAbsoluteY = primaryPosition.y + (primarySize.positions[0]?.y ?? FILE_GROUP_HEADER);
     const sideCursor = new Map<"incoming" | "outgoing", number>();
     (["incoming", "outgoing"] as const).forEach((direction) => {
@@ -1873,7 +2098,7 @@ function layoutExpandedGraph(
       const safePath = group.path.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
       const groupId = `dependency-file-${group.scope}-${group.direction}-${safePath}`;
       const relatedY = sideCursor.get(group.direction) ?? selectedAbsoluteY;
-      const laneGap = 320;
+      const laneGap = 240;
       const relatedX = group.direction === "incoming"
         ? primaryPosition.x - group.size.width - laneGap
         : primaryPosition.x + primarySize.width + laneGap;
@@ -1979,7 +2204,7 @@ function layoutSystemBehaviorGraph(
       ...makeEdge(source, target, label, color),
       id: `hld-edge-${source}-${target}`,
       data: { dependency: true, dependencyScope: scope, count: members.length, primaryLabel: naturalLabel, members },
-      style: { stroke: color, strokeWidth: 2.5 },
+      style: { stroke: color, strokeWidth: 1.7 },
     } satisfies Edge;
   };
 
@@ -1997,54 +2222,71 @@ function layoutSystemBehaviorGraph(
       const [source, target] = key.split("|");
       return makeHldEdge(source, target, members, scopeFor(source, target));
     });
-    const ranks = rankBehaviorGraph(journeyNodes, candidateEdges, Math.max(12, journeyNodes.length));
-    const rankById = new Map<string, number>();
-    ranks.forEach((rank, rankIndex) => rank.forEach((node) => rankById.set(node.id, rankIndex)));
-    const forwardEdges = candidateEdges.filter((edge) => (rankById.get(edge.source) ?? 0) < (rankById.get(edge.target) ?? 0));
     const connectedIds = new Set(journeyNodes.map((node) => node.id));
-    const visibleNodes = journeyNodes;
-    const fallbackPlan = fallbackJourneyStagePlan({ id: stagePlan?.journeyId ?? "visible-journey", anchorId: focused.id, title: focused.data.title, description: "", nodeIds: visibleNodes.map((node) => node.id), contracts: [] }, analysis);
+    const fallbackPlan = fallbackJourneyStagePlan({ id: stagePlan?.journeyId ?? "visible-journey", anchorId: focused.id, title: focused.data.title, description: "", nodeIds: journeyNodes.map((node) => node.id), contracts: [] }, analysis);
     const effectivePlan = stagePlan && stagePlan.steps.length ? stagePlan : fallbackPlan;
     const validSteps = effectivePlan.steps.filter((step) => connectedIds.has(step.nodeId));
+    // AI ordering can intentionally exclude contextual nodes. Previously those
+    // nodes were still rendered without a stage, so React Flow placed them at
+    // fallback coordinates where they overlapped stage-owned cards. Only nodes
+    // with a validated stage step belong in the focused journey canvas.
+    const visibleNodeIds = new Set(validSteps.map((step) => step.nodeId));
+    const visibleNodes = journeyNodes.filter((node) => visibleNodeIds.has(node.id));
+    const visibleCandidateEdges = candidateEdges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target));
+    const ranks = rankBehaviorGraph(visibleNodes, visibleCandidateEdges, Math.max(12, visibleNodes.length));
+    const rankById = new Map<string, number>();
+    ranks.forEach((rank, rankIndex) => rank.forEach((node) => rankById.set(node.id, rankIndex)));
+    const forwardEdges = visibleCandidateEdges.filter((edge) => (rankById.get(edge.source) ?? 0) < (rankById.get(edge.target) ?? 0));
     const stepById = new Map(validSteps.map((step) => [step.nodeId, step]));
     const journeyEdges = forwardEdges.map((edge) => {
-      const sourceStage = stepById.get(edge.source)?.stage;
-      const targetStage = stepById.get(edge.target)?.stage;
-      const branchStage = ([targetStage, sourceStage].find((stage) => stage === "async" || stage === "fallback" || stage === "error")) as JourneyStage | undefined;
-      if (!branchStage) return edge;
-      const color = branchStage === "error" ? "#EC5D5E" : branchStage === "fallback" ? "#FFCA16" : "#23AFD0";
+      const sourceLane = stepById.get(edge.source)?.lane;
+      const targetLane = stepById.get(edge.target)?.lane;
+      const branchLane = ([targetLane, sourceLane].find((lane) => lane && lane !== "main")) as Exclude<JourneyLane, "main"> | undefined;
+      if (!branchLane) return edge;
+      const color = branchLane === "error" ? "#EC5D5E"
+        : branchLane === "fallback" || branchLane === "retry" ? "#FFCA16"
+          : branchLane === "rejection" ? "#C792EA"
+            : branchLane === "compensation" ? "#F78C6C"
+              : "#23AFD0";
       return {
         ...edge,
         markerEnd: { type: MarkerType.ArrowClosed, color },
-        style: { ...edge.style, stroke: color, strokeDasharray: branchStage === "async" ? "13 10" : "9 8" },
-        data: { ...(edge.data ?? {}), journeyBranch: branchStage },
+        style: { ...edge.style, stroke: color, strokeDasharray: "none" },
+        data: { ...(edge.data ?? {}), journeyBranch: branchLane },
       } satisfies Edge;
     });
     const journeyPositions = new Map<string, { x: number; y: number }>();
     const stageGroups: JourneyStageNode[] = [];
-    const usedStages = JOURNEY_STAGE_ORDER.filter((stage) => validSteps.some((step) => step.stage === stage));
-    const stageRank = (stage: JourneyStage) => {
-      const values = visibleNodes.filter((node) => stepById.get(node.id)?.stage === stage).map((node) => rankById.get(node.id) ?? 0).sort((left, right) => left - right);
-      return values.length ? values[Math.floor(values.length / 2)] : JOURNEY_STAGE_ORDER.indexOf(stage);
+    const usedStages = JOURNEY_SECTION_ORDER.filter((stage) => validSteps.some((step) => journeySection(step) === stage));
+    const stageRank = (stage: JourneySection) => {
+      const values = visibleNodes.filter((node) => {
+        const step = stepById.get(node.id);
+        return step ? journeySection(step) === stage : false;
+      }).map((node) => rankById.get(node.id) ?? 0).sort((left, right) => left - right);
+      return values.length ? values[Math.floor(values.length / 2)] : JOURNEY_SECTION_ORDER.indexOf(stage);
     };
-    const preferredStages = [...usedStages].sort((left, right) => stageRank(left) - stageRank(right) || JOURNEY_STAGE_ORDER.indexOf(left) - JOURNEY_STAGE_ORDER.indexOf(right));
-    const branchStages = new Set<JourneyStage>(["async", "fallback", "error"]);
+    const preferredStages = [...usedStages].sort((left, right) => stageRank(left) - stageRank(right) || JOURNEY_SECTION_ORDER.indexOf(left) - JOURNEY_SECTION_ORDER.indexOf(right));
+    const branchStages = new Set<JourneySection>(["async", "rejection", "retry", "fallback", "error", "compensation"]);
     const orderedStages = [
       ...preferredStages.filter((stage) => !branchStages.has(stage)),
       ...preferredStages.filter((stage) => branchStages.has(stage)),
     ];
-    const stageHeader = 108;
-    const edgeRail = 80;
-    const stagePadding = 68;
-    const verticalStageGap = 300;
-    const rankColumnGap = 380;
+    const stageHeader = 84;
+    const edgeRail = 56;
+    const stagePadding = 48;
+    const horizontalStageGap = 280;
+    const verticalStageGap = 220;
+    const rankColumnGap = 260;
     const rankColumnStep = BEHAVIOR_CARD_WIDTH + rankColumnGap;
-    const sameRankCardGap = 170;
-    const contentAllowance = 210;
-    const stageLayouts = new Map<JourneyStage, { x: number; y: number; width: number; height: number; minRank: number; nodes: SemanticNode[] }>();
-    let stageCursorY = 120;
+    const sameRankCardGap = 110;
+    const contentAllowance = 110;
+    const stageLayouts = new Map<JourneySection, { x: number; y: number; width: number; height: number; minRank: number; nodes: SemanticNode[] }>();
+    const stageBlueprints = new Map<JourneySection, { width: number; height: number; minRank: number; nodes: SemanticNode[] }>();
     orderedStages.forEach((stage) => {
-      const stageNodes = visibleNodes.filter((node) => stepById.get(node.id)?.stage === stage)
+      const stageNodes = visibleNodes.filter((node) => {
+        const step = stepById.get(node.id);
+        return step ? journeySection(step) === stage : false;
+      })
         .sort((left, right) => (rankById.get(left.id) ?? 0) - (rankById.get(right.id) ?? 0) || (stepById.get(left.id)?.sequence ?? 0) - (stepById.get(right.id)?.sequence ?? 0));
       const ranksInStage = stageNodes.map((node) => rankById.get(node.id) ?? 0);
       const minRank = Math.min(...ranksInStage);
@@ -2054,14 +2296,32 @@ function layoutSystemBehaviorGraph(
         const rank = rankById.get(node.id) ?? 0;
         rankGroups.set(rank, [...(rankGroups.get(rank) ?? []), node]);
       });
-      const tallestColumn = Math.max(360, ...[...rankGroups.values()].map((nodesInRank) => (
+      const tallestColumn = Math.max(280, ...[...rankGroups.values()].map((nodesInRank) => (
         nodesInRank.reduce((height, node) => height + estimatedBehaviorHeight(node, true) + contentAllowance, 0)
           + Math.max(0, nodesInRank.length - 1) * sameRankCardGap
       )));
       const stageWidth = stagePadding * 2 + (maxRank - minRank) * rankColumnStep + BEHAVIOR_CARD_WIDTH;
       const stageHeight = stageHeader + edgeRail + stagePadding * 2 + tallestColumn;
-      stageLayouts.set(stage, { x: minRank * rankColumnStep, y: stageCursorY, width: stageWidth, height: stageHeight, minRank, nodes: stageNodes });
-      stageCursorY += stageHeight + verticalStageGap;
+      stageBlueprints.set(stage, { width: stageWidth, height: stageHeight, minRank, nodes: stageNodes });
+    });
+    const stageRowCount = orderedStages.length >= 7 ? 3 : orderedStages.length >= 3 ? 2 : 1;
+    const stageColumnCount = Math.ceil(orderedStages.length / stageRowCount);
+    const columnWidths = Array.from({ length: stageColumnCount }, () => 0);
+    const rowHeights = Array.from({ length: stageRowCount }, () => 0);
+    orderedStages.forEach((stage, index) => {
+      const blueprint = stageBlueprints.get(stage)!;
+      const columnIndex = Math.floor(index / stageRowCount);
+      const rowIndex = index % stageRowCount;
+      columnWidths[columnIndex] = Math.max(columnWidths[columnIndex], blueprint.width);
+      rowHeights[rowIndex] = Math.max(rowHeights[rowIndex], blueprint.height);
+    });
+    const columnOffsets = columnWidths.map((_, index) => 88 + columnWidths.slice(0, index).reduce((total, width) => total + width + horizontalStageGap, 0));
+    const rowOffsets = rowHeights.map((_, index) => 88 + rowHeights.slice(0, index).reduce((total, height) => total + height + verticalStageGap, 0));
+    orderedStages.forEach((stage, index) => {
+      const blueprint = stageBlueprints.get(stage)!;
+      const columnIndex = Math.floor(index / stageRowCount);
+      const rowIndex = index % stageRowCount;
+      stageLayouts.set(stage, { ...blueprint, x: columnOffsets[columnIndex], y: rowOffsets[rowIndex] });
     });
     orderedStages.forEach((stage) => {
       const layout = stageLayouts.get(stage)!;
@@ -2089,7 +2349,7 @@ function layoutSystemBehaviorGraph(
     });
     const graphNodes = visibleNodes.map((node, index) => ({
           ...node,
-          position: journeyPositions.get(node.id) ?? { x: (rankById.get(node.id) ?? 0) * 920, y: index * 520 + 160 },
+          position: journeyPositions.get(node.id) ?? { x: (rankById.get(node.id) ?? 0) * 700, y: index * 380 + 112 },
           style: { ...node.style, zIndex: node.id === selectedBehaviorId ? 4 : 3 },
           data: {
             ...node.data,
@@ -2126,17 +2386,17 @@ function layoutSystemBehaviorGraph(
         .filter((group) => group.direction === direction)
         .sort((a, b) => b.members.length - a.members.length || (nodeById.get(a.relatedId)?.data.title ?? "").localeCompare(nodeById.get(b.relatedId)?.data.title ?? "")),
     }));
-    const sideGap = 170;
+    const sideGap = 110;
     const sideHeight = (items: typeof sides[number]["groups"]) => items.reduce((total, group) => {
       const node = nodeById.get(group.relatedId);
-      return total + (node ? estimatedBehaviorHeight(node, true) + 76 : 0);
+      return total + (node ? estimatedBehaviorHeight(node, true) + 52 : 0);
     }, 0) + Math.max(0, items.length - 1) * sideGap;
-    const selectedHeight = estimatedBehaviorHeight(focused, true) + 76;
+    const selectedHeight = estimatedBehaviorHeight(focused, true) + 52;
     const maxHeight = Math.max(selectedHeight, ...sides.map((side) => sideHeight(side.groups)));
-    const centerY = 140 + maxHeight / 2;
+    const centerY = 104 + maxHeight / 2;
     const graphNodes: Array<StructureNode | SemanticNode | FileContainerNode> = [{
       ...focused,
-      position: { x: 940, y: centerY - selectedHeight / 2 },
+      position: { x: 720, y: centerY - selectedHeight / 2 },
       style: { ...focused.style, zIndex: 3 },
       data: {
         ...focused.data,
@@ -2154,11 +2414,11 @@ function layoutSystemBehaviorGraph(
         const related = nodeById.get(group.relatedId);
         if (!related) return;
         const visualId = `hld-${side.direction}-${related.id}`;
-        const height = estimatedBehaviorHeight(related, true) + 76;
+        const height = estimatedBehaviorHeight(related, true) + 52;
         graphNodes.push({
           ...related,
           id: visualId,
-          position: { x: side.direction === "incoming" ? 0 : 1880, y: cursorY },
+          position: { x: side.direction === "incoming" ? 0 : 1440, y: cursorY },
           style: { ...related.style, zIndex: 3 },
           data: {
             ...related.data,
@@ -2235,7 +2495,7 @@ function layoutSystemBehaviorGraph(
   const overviewPositions = arrangeHldRanks(visibleRanks, hldEdges, true);
   const graphNodes = visibleRanks.flatMap((rank, rankIndex) => rank.map((node, index) => ({
     ...node,
-    position: overviewPositions.get(node.id) ?? { x: rankIndex * 820, y: index * 370 + 160 },
+    position: overviewPositions.get(node.id) ?? { x: rankIndex * 640, y: index * 300 + 112 },
     data: {
       ...node.data,
       sourcePath: primaryFileForNode(node),
@@ -2278,11 +2538,11 @@ function GraphEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, tar
 
   return (
     <>
-      <BaseEdge id={`${id}-halo`} path={path} style={{ stroke: "#1E1E1E", strokeWidth: visual.active ? 10 : 8, opacity: visual.dimmed ? .3 : .98 }} />
-      <BaseEdge id={id} className={`graph-edge-path ${visual.dependency ? "dependency-edge" : ""} ${visual.dependencyScope === "same-file" ? "same-file-dependency" : ""}`} path={path} markerEnd={markerEnd} style={{ ...style, strokeWidth: style?.strokeWidth ?? 1.7, strokeDasharray: style?.strokeDasharray ?? (visual.dependency ? undefined : "7 8") }} />
+      <BaseEdge id={`${id}-halo`} path={path} style={{ stroke: "#1E1E1E", strokeWidth: visual.active ? 7 : 5, opacity: visual.dimmed ? .3 : .94 }} />
+      <BaseEdge id={id} className={`graph-edge-path ${visual.dependency ? "dependency-edge" : ""} ${visual.dependencyScope === "same-file" ? "same-file-dependency" : ""}`} path={path} markerEnd={markerEnd} style={{ ...style, strokeWidth: style?.strokeWidth ?? 1.3, strokeDasharray: "none" }} />
       {label && visual.showLabel ? (
         <EdgeLabelRenderer>
-          <span className="graph-edge-label" style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}>{String(label)}</span>
+          <span className="graph-edge-label" style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px) scale(var(--edge-label-scale, 1))` }}>{String(label)}</span>
         </EdgeLabelRenderer>
       ) : null}
     </>
@@ -2442,6 +2702,30 @@ function NodePortHandles({ inputs = [], outputs = [] }: { inputs?: string[]; out
   );
 }
 
+function behaviorPoints(value: string) {
+  const text = String(value || "").trim();
+  if (!text) return [];
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const hasExplicitBullets = lines.some((line) => /^(?:[-*•▪‣]|\d+[.)])\s+/.test(line));
+  if (hasExplicitBullets || lines.length > 1) {
+    return lines.map((line) => line.replace(/^(?:[-*•▪‣]|\d+[.)])\s+/, "").trim()).filter(Boolean);
+  }
+  return text
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9])/)
+    .map((point) => point.trim())
+    .filter(Boolean);
+}
+
+function BehaviorPointList({ text, className = "", ariaLabel }: { text: string; className?: string; ariaLabel?: string }) {
+  const points = behaviorPoints(text);
+  return (
+    <ul className={`behavior-points ${className}`.trim()} aria-label={ariaLabel}>
+      {points.map((point, index) => <li key={`${index}-${point.slice(0, 32)}`}>{point}</li>)}
+    </ul>
+  );
+}
+
 function SemanticNodeView({ id, data, selected }: NodeProps<SemanticNode>) {
   const isBaseline = data.stage === "baseline";
   const animationDelay = `${Math.min(data.revealIndex ?? 0, 10) * 42}ms`;
@@ -2483,12 +2767,12 @@ function SemanticNodeView({ id, data, selected }: NodeProps<SemanticNode>) {
         </div>
       </header>
       {data.relationState === "internal" ? <span className="internal-relation-tag"><i />Same-file relation</span> : null}
-      <p className="compact-behavior-preview">{isBaseline ? data.summary : data.after}</p>
+      <p className="compact-behavior-preview">{behaviorPoints(isBaseline ? data.summary : data.after).join(" • ")}</p>
       {isBaseline ? (
-        <div className="node-info-row"><span>Behavior</span><p>{data.summary}</p></div>
+        <div className="node-info-row"><span>Behavior</span><BehaviorPointList text={data.summary} ariaLabel={`${data.title} behavior`} /></div>
       ) : (
         <div className="node-delta">
-          <span>{data.before}</span><b>→</b><span>{data.after}</span>
+          <BehaviorPointList text={data.before} className="before" ariaLabel="Behavior before this change" /><b>→</b><BehaviorPointList text={data.after} className="after" ariaLabel="Behavior after this change" />
         </div>
       )}
       <div className="node-footer"><span>{data.lineIds.length} lines</span><span>{isBaseline ? "existing" : "changed"}</span></div>
@@ -2519,8 +2803,8 @@ function FileContainerView({ data }: NodeProps<FileContainerNode>) {
   const eyebrow = internal ? `Same file · ${directionLabel}` : expanded ? "Behavior gallery" : directionLabel;
   return (
     <section className={`file-container-node context-${data.context} ${data.flowDirection ? `flow-${data.flowDirection}` : ""}`}>
-      {(data.inputHandles ?? []).map((id, index) => <Handle key={id} id={id} type="target" position={Position.Left} style={{ top: 72 + index * 18 }} />)}
-      {(data.outputHandles ?? []).map((id, index) => <Handle key={id} id={id} type="source" position={Position.Right} style={{ top: 72 + index * 18 }} />)}
+      {(data.inputHandles ?? []).map((id, index) => <Handle key={id} id={id} type="target" position={Position.Left} style={{ top: 54 + index * 14 }} />)}
+      {(data.outputHandles ?? []).map((id, index) => <Handle key={id} id={id} type="source" position={Position.Right} style={{ top: 54 + index * 14 }} />)}
       <header>
         <div className="file-container-title">
           <span>{eyebrow}</span>
@@ -2594,6 +2878,7 @@ function CodeEvidencePanel({
   const [activePath, setActivePath] = useState(evidenceFiles[0]?.path ?? "");
   const mode: CodePanelMode = "full";
   const [rangeIndex, setRangeIndex] = useState(0);
+  const [editorFontSize, setEditorFontSize] = useState(12);
   const [remoteFiles, setRemoteFiles] = useState<Record<string, string>>({});
   const [loadingPath, setLoadingPath] = useState<string | null>(null);
   const [fileError, setFileError] = useState("");
@@ -2601,6 +2886,7 @@ function CodeEvidencePanel({
   const editorApiRef = useRef<Parameters<OnMount>[1] | null>(null);
   const editorLayoutRef = useRef<{ layout(): void } | null>(null);
   const decorationsRef = useRef<ReturnType<Parameters<OnMount>[0]["createDecorationsCollection"]> | null>(null);
+  const fontShortcutDisposablesRef = useRef<Array<{ dispose(): void }>>([]);
 
   const activeEvidence = evidenceFiles.find((file) => file.path === activePath) ?? evidenceFiles[0];
   const localContent = activeEvidence ? sourceFiles.get(activeEvidence.path) : undefined;
@@ -2673,19 +2959,44 @@ function CodeEvidencePanel({
     if (activeRange && activeRange.startLine <= lineCount) editor.revealLineInCenter(activeRange.startLine);
   }, [activeRange, navigationRanges, stage]);
 
+  const installEditorFontShortcuts = useCallback((editors: Parameters<OnMount>[0][]) => {
+    fontShortcutDisposablesRef.current.forEach((disposable) => disposable.dispose());
+    fontShortcutDisposablesRef.current = editors.map((editor) => editor.onKeyDown((event) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      const key = event.browserEvent.key;
+      if (!["+", "=", "-", "_", "0", "Add", "Subtract"].includes(key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (key === "0") {
+        setEditorFontSize(12);
+        return;
+      }
+      const direction = key === "+" || key === "=" || key === "Add" ? 1 : -1;
+      setEditorFontSize((current) => Math.min(24, Math.max(9, current + direction)));
+    }));
+  }, []);
+
   const configureEditor = useCallback<OnMount>((editor, monacoApi) => {
     editorRef.current = editor;
     editorApiRef.current = monacoApi;
     editorLayoutRef.current = editor;
+    installEditorFontShortcuts([editor]);
     refreshEvidenceDecorations();
-  }, [refreshEvidenceDecorations]);
+  }, [installEditorFontShortcuts, refreshEvidenceDecorations]);
 
   const configureDiffEditor = useCallback<DiffOnMount>((diffEditor, monacoApi) => {
+    const original = diffEditor.getOriginalEditor();
     const modified = diffEditor.getModifiedEditor();
     editorRef.current = modified;
     editorApiRef.current = monacoApi;
     editorLayoutRef.current = diffEditor;
+    installEditorFontShortcuts([original, modified]);
     modified.revealLineInCenter(1);
+  }, [installEditorFontShortcuts]);
+
+  useEffect(() => () => {
+    fontShortcutDisposablesRef.current.forEach((disposable) => disposable.dispose());
+    fontShortcutDisposablesRef.current = [];
   }, []);
 
   useEffect(() => {
@@ -2750,6 +3061,7 @@ function CodeEvidencePanel({
   };
 
   const language = editorLanguageForFile(activeEvidence?.path ?? "");
+  const editorLineHeight = Math.round(editorFontSize * 1.65);
   return (
     <aside className="code-evidence-panel" aria-label="Code evidence for selected behavior">
       <div className="code-panel-resizer" onPointerDown={beginResize} role="separator" aria-orientation="vertical" aria-label="Resize code evidence panel" />
@@ -2761,15 +3073,20 @@ function CodeEvidencePanel({
         </div>
         <button type="button" className="code-panel-collapse" onClick={onCollapse} aria-label="Collapse code evidence panel" title="Hide code panel"><PanelRightClose aria-hidden="true" /><span>Hide</span></button>
       </header>
-      <nav className="code-file-tabs" aria-label="Source files containing this behavior">
-        {evidenceFiles.map((file) => (
-          <button type="button" key={file.path} className={file.path === activeEvidence?.path ? "active" : ""} onClick={() => { setActivePath(file.path); setFileError(""); setRangeIndex(0); }} title={file.path}>
-            <span>{file.path.split("/").pop()}</span><small>{file.ranges.length} range{file.ranges.length === 1 ? "" : "s"}</small>
-          </button>
-        ))}
-      </nav>
       <div className="code-panel-context">
-        <div><span>{activeEvidence?.path || "No source file"}</span><strong>{ranges.length ? `${ranges.length} highlighted evidence range${ranges.length === 1 ? "" : "s"}` : "Full source file"}</strong></div>
+        <div className="code-path-block">
+          {evidenceFiles.length > 1 ? (
+            <select
+              className="code-path-select"
+              value={activeEvidence?.path ?? ""}
+              onChange={(event) => { setActivePath(event.target.value); setFileError(""); setRangeIndex(0); }}
+              aria-label="Source file containing this behavior"
+            >
+              {evidenceFiles.map((file) => <option key={file.path} value={file.path}>{file.path}</option>)}
+            </select>
+          ) : <span title={activeEvidence?.path}>{activeEvidence?.path || "No source file"}</span>}
+          <strong>{ranges.length ? `${ranges.length} highlighted evidence range${ranges.length === 1 ? "" : "s"}` : "Full source file"}</strong>
+        </div>
         {stage === "baseline" ? (
           <div className="full-file-indicator" aria-label="Code visibility">
             <span className="full-file-label"><i />Full file</span>
@@ -2788,7 +3105,7 @@ function CodeEvidencePanel({
             language={language}
             theme="vs-dark"
             onMount={configureEditor}
-            options={{ readOnly: true, automaticLayout: false, fontFamily: "Cascadia Code, Cascadia Mono, Consolas, monospace", fontSize: 14, lineHeight: 23, glyphMargin: true, folding: true, lineNumbers: mode === "relevant" ? (lineNumber) => baselineView.originalLineNumbers?.[lineNumber - 1] ? String(baselineView.originalLineNumbers[lineNumber - 1]) : "â‹¯" : "on", minimap: { enabled: true, maxColumn: 80 }, padding: { top: 18, bottom: 18 }, renderLineHighlight: "none", scrollBeyondLastLine: false, smoothScrolling: true, stickyScroll: { enabled: true }, wordWrap: "off" }}
+            options={{ readOnly: true, automaticLayout: false, fontFamily: "JetBrains Mono, Cascadia Code, Cascadia Mono, Consolas, monospace", fontLigatures: true, fontSize: editorFontSize, lineHeight: editorLineHeight, glyphMargin: true, folding: true, lineNumbers: mode === "relevant" ? (lineNumber) => baselineView.originalLineNumbers?.[lineNumber - 1] ? String(baselineView.originalLineNumbers[lineNumber - 1]) : "â‹¯" : "on", minimap: { enabled: false }, padding: { top: 18, bottom: 18 }, renderLineHighlight: "none", scrollBeyondLastLine: false, smoothScrolling: true, stickyScroll: { enabled: true }, wordWrap: "off" }}
           />
         ) : (
           <DiffEditor
@@ -2799,7 +3116,7 @@ function CodeEvidencePanel({
             language={language}
             theme="vs-dark"
             onMount={configureDiffEditor}
-            options={{ readOnly: true, automaticLayout: false, fontFamily: "Cascadia Code, Cascadia Mono, Consolas, monospace", fontSize: 13, lineHeight: 22, minimap: { enabled: false }, renderSideBySide: width >= 680, scrollBeyondLastLine: false, wordWrap: "on" }}
+            options={{ readOnly: true, automaticLayout: false, fontFamily: "JetBrains Mono, Cascadia Code, Cascadia Mono, Consolas, monospace", fontLigatures: true, fontSize: editorFontSize, lineHeight: editorLineHeight, minimap: { enabled: false }, renderSideBySide: width >= 680, scrollBeyondLastLine: false, wordWrap: "on" }}
           />
         )}
       </div>
@@ -2890,10 +3207,14 @@ export default function Home() {
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
   const [selectedDependencyEdgeId, setSelectedDependencyEdgeId] = useState<string | null>(null);
   const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(() => new Set());
+  const [hiddenExtensions, setHiddenExtensions] = useState<Set<string>>(() => new Set());
+  const [extensionFilterOpen, setExtensionFilterOpen] = useState(false);
+  const [extensionPreferencesLoaded, setExtensionPreferencesLoaded] = useState(false);
   const [codePanelOpen, setCodePanelOpen] = useState(false);
   const [codePanelWidth, setCodePanelWidth] = useState(560);
   const [activityPanelOpen, setActivityPanelOpen] = useState(true);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const graphCanvasRef = useRef<HTMLDivElement>(null);
   const graphInstanceRef = useRef<ReactFlowInstance | null>(null);
   const previousViewportRef = useRef<{ x: number; y: number; zoom: number } | null>(null);
   const previousFocusRef = useRef<string | null>(null);
@@ -2910,6 +3231,25 @@ export default function Home() {
   useEffect(() => {
     folderInputRef.current?.setAttribute("webkitdirectory", "");
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const saved = JSON.parse(window.localStorage.getItem("changegraph-hidden-extensions") ?? "[]");
+        if (Array.isArray(saved)) setHiddenExtensions(new Set(saved.filter((item): item is string => typeof item === "string")));
+      } catch {
+        // A malformed local preference should never block the graph.
+      } finally {
+        setExtensionPreferencesLoaded(true);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!extensionPreferencesLoaded) return;
+    window.localStorage.setItem("changegraph-hidden-extensions", JSON.stringify([...hiddenExtensions].sort()));
+  }, [extensionPreferencesLoaded, hiddenExtensions]);
 
   useEffect(() => {
     const jobId = new URLSearchParams(window.location.search).get("job");
@@ -3005,13 +3345,44 @@ export default function Home() {
   }, [checkProviderHealth]);
 
   const analysis = stage === "baseline" ? baseline : change;
+  const extensionOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    analysis.nodes.forEach((node) => {
+      const extension = fileExtensionKey(primaryFileForNode(node));
+      counts.set(extension, (counts.get(extension) ?? 0) + 1);
+    });
+    return [...counts.entries()]
+      .map(([extension, count]) => ({ extension, label: fileExtensionLabel(extension), count }))
+      .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+  }, [analysis.nodes]);
+  const activeHiddenExtensionCount = useMemo(
+    () => extensionOptions.filter((option) => hiddenExtensions.has(option.extension)).length,
+    [extensionOptions, hiddenExtensions],
+  );
+  const graphAnalysis = useMemo<AnalysisResult>(() => {
+    if (!hiddenExtensions.size) return analysis;
+    const nodes = analysis.nodes.filter((node) => !hiddenExtensions.has(fileExtensionKey(primaryFileForNode(node))));
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const inventory = analysis.inventory.filter((line) => !hiddenExtensions.has(fileExtensionKey(line.file)));
+    const classifiedLineIds = new Set(nodes.flatMap((node) => node.data.lineIds));
+    const classified = inventory.filter((line) => classifiedLineIds.has(line.id)).length;
+    return {
+      ...analysis,
+      nodes,
+      edges: analysis.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)),
+      inventory,
+      classified,
+      unknown: Math.max(0, inventory.length - classified),
+    };
+  }, [analysis, hiddenExtensions]);
   const selectedNode = useMemo(
     () => analysis.nodes.find((node) => node.id === selectedId) ?? analysis.nodes[0],
     [analysis, selectedId],
   );
   const sourceFiles = useMemo(() => repositoryFilesFromSource(analysis.source), [analysis.source]);
-  const subsystemGroups = useMemo(() => buildSubsystemGroups(analysis.nodes), [analysis.nodes]);
-  const behaviorOwnership = useMemo(() => buildBehaviorOwnership(subsystemGroups), [subsystemGroups]);
+  const allSubsystemGroups = useMemo(() => buildSubsystemGroups(analysis.nodes), [analysis.nodes]);
+  const subsystemGroups = useMemo(() => buildSubsystemGroups(graphAnalysis.nodes), [graphAnalysis.nodes]);
+  const behaviorOwnership = useMemo(() => buildBehaviorOwnership(allSubsystemGroups), [allSubsystemGroups]);
   const selectedSubsystem = useMemo(
     () => subsystemGroups.find((group) => group.id === activeSubsystem) ?? null,
     [activeSubsystem, subsystemGroups],
@@ -3027,9 +3398,9 @@ export default function Home() {
   const orderedFileBehaviors = useMemo(() => {
     if (!selectedFile) return [];
     const ids = new Set(selectedFile.nodes.map((node) => node.id));
-    const internalEdges = analysis.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target));
+    const internalEdges = graphAnalysis.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target));
     return rankBehaviorGraph(selectedFile.nodes, internalEdges).flat();
-  }, [analysis.edges, selectedFile]);
+  }, [graphAnalysis.edges, selectedFile]);
   const activeFileBehaviorIndex = useMemo(
     () => orderedFileBehaviors.findIndex((node) => node.id === focusedNodeId),
     [focusedNodeId, orderedFileBehaviors],
@@ -3079,10 +3450,18 @@ export default function Home() {
     void orderJourneys();
     return () => { cancelled = true; controller.abort(); };
   }, [demoMode, discoveredSystemJourneys, graphMode, orderingContext, provider, status]);
-  const systemJourneys = useMemo(
+  const orderedSystemJourneys = useMemo(
     () => orderedJourneysFromPlan(discoveredSystemJourneys, journeyOrderPlan),
     [discoveredSystemJourneys, journeyOrderPlan],
   );
+  const systemJourneys = useMemo(() => {
+    const visibleIds = new Set(graphAnalysis.nodes.map((node) => node.id));
+    return orderedSystemJourneys.flatMap((journey) => {
+      const nodeIds = journey.nodeIds.filter((nodeId) => visibleIds.has(nodeId));
+      if (!nodeIds.length) return [];
+      return [{ ...journey, anchorId: nodeIds.includes(journey.anchorId) ? journey.anchorId : nodeIds[0], nodeIds }];
+    });
+  }, [graphAnalysis.nodes, orderedSystemJourneys]);
   const journeyOrderById = useMemo(
     () => new Map((journeyOrderPlan?.journeys ?? []).map((item) => [item.journeyId, item])),
     [journeyOrderPlan],
@@ -3152,9 +3531,9 @@ export default function Home() {
   }, [activeSystemJourney, analysis, behaviorOwnership, demoMode, journeyStagePlans, provider, status]);
   const visibleGraph = useMemo(
     () => graphMode === "behavior"
-      ? layoutSystemBehaviorGraph(analysis, behaviorOwnership, focusedNodeId, activeSystemJourney?.nodeIds, activeJourneyStagePlan, selectedId)
-      : layoutExpandedGraph(repository?.name ?? "Current repository", analysis, subsystemGroups, selectedSubsystem, selectedModule, selectedFile, focusedNodeId),
-    [activeJourneyStagePlan, activeSystemJourney?.nodeIds, analysis, behaviorOwnership, focusedNodeId, graphMode, repository?.name, selectedFile, selectedId, selectedModule, selectedSubsystem, subsystemGroups],
+      ? layoutSystemBehaviorGraph(graphAnalysis, behaviorOwnership, focusedNodeId, activeSystemJourney?.nodeIds, activeJourneyStagePlan, selectedId)
+      : layoutExpandedGraph(repository?.name ?? "Current repository", graphAnalysis, subsystemGroups, selectedSubsystem, selectedModule, selectedFile, focusedNodeId),
+    [activeJourneyStagePlan, activeSystemJourney?.nodeIds, behaviorOwnership, focusedNodeId, graphAnalysis, graphMode, repository?.name, selectedFile, selectedId, selectedModule, selectedSubsystem, subsystemGroups],
   );
   const toggleNodeCollapsed = useCallback((nodeId: string) => {
     setCollapsedNodeIds((current) => {
@@ -3201,6 +3580,15 @@ export default function Home() {
     const firstFrame = window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         if (graphMode === "behavior") {
+          if (activeSystemJourney) {
+            const target = instance.getNode(activeSystemJourney.anchorId);
+            if (target) {
+              const width = target.measured?.width ?? BEHAVIOR_CARD_WIDTH;
+              const height = target.measured?.height ?? 280;
+              void instance.setCenter(target.position.x + width / 2, target.position.y + height / 2, { zoom: compact ? .62 : .72, duration: 560 });
+              return;
+            }
+          }
           void instance.fitView({ padding: .16, minZoom: .08, maxZoom: .72, duration: 560 });
           return;
         }
@@ -3217,7 +3605,7 @@ export default function Home() {
       });
     });
     return () => window.cancelAnimationFrame(firstFrame);
-  }, [activeFile, activeModule, activeSubsystem, graphMode]);
+  }, [activeFile, activeModule, activeSubsystem, activeSystemJourney, compact, graphMode, hiddenExtensions]);
   useEffect(() => {
     const instance = graphInstanceRef.current;
     if (!instance) return;
@@ -3284,12 +3672,14 @@ export default function Home() {
       members: (data.members ?? []).map((member) => {
         const source = semanticById.get(member.source);
         const target = semanticById.get(member.target);
+        const sourceFile = source ? primaryFileForNode(source) : "Unknown source";
+        const targetFile = target ? primaryFileForNode(target) : "Unknown target";
         return {
           ...member,
           sourceTitle: source?.data.codeIdentity || source?.data.title || member.source,
           targetTitle: target?.data.codeIdentity || target?.data.title || member.target,
-          sourceFile: source ? primaryFileForNode(source) : "Unknown source",
-          targetFile: target ? primaryFileForNode(target) : "Unknown target",
+          sourceFile: compactFileLabel(sourceFile),
+          targetFile: compactFileLabel(targetFile),
           plainLabel: plainDependencyLabel(member.label, target),
         };
       }),
@@ -3312,7 +3702,7 @@ export default function Home() {
       return {
         ...edge,
         data: { ...(edge.data ?? {}), active, dimmed, showLabel: active },
-        style: { ...edge.style, opacity: dimmed ? .08 : active ? 1 : dependency ? .72 : .84, strokeWidth: active ? 3.4 : dependency ? 2.5 : 2.1 },
+        style: { ...edge.style, opacity: dimmed ? .08 : active ? 1 : dependency ? .72 : .84, strokeWidth: active ? 2.5 : dependency ? 1.7 : 1.35 },
       };
     });
   }, [focusedNodeId, hoveredEdgeId, selectedDependencyEdgeId, visibleGraph.edges]);
@@ -3443,6 +3833,35 @@ export default function Home() {
     focusVisibleNode(nextIndex);
   }, [focusVisibleNode, focusedNodeIndex, orderedVisibleNodes.length]);
 
+  const focusDependencyEndpoint = useCallback((nodeId: string) => {
+    const node = visibleGraph.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+
+    setSelectedDependencyEdgeId(null);
+    setHoveredEdgeId(null);
+    const semanticId = node.type === "semantic" ? ((node.data as SemanticNodeData).semanticId || node.id) : node.id;
+    if (node.type === "semantic" && graphMode === "behavior") {
+      selectSystemBehavior(semanticId);
+    } else if (node.type === "semantic") {
+      const owner = behaviorOwnership.get(semanticId);
+      if (owner && owner.fileId !== activeFile) {
+        setActiveSubsystem(owner.subsystemId);
+        setActiveModule(owner.moduleId);
+        setActiveFile(owner.fileId);
+      }
+      setFocusedNodeId(semanticId);
+      setSelectedId(semanticId);
+      setCodePanelOpen(true);
+    }
+
+    const instance = graphInstanceRef.current;
+    const graphNode = instance?.getNode(nodeId) ?? node;
+    const width = graphNode.measured?.width ?? BEHAVIOR_CARD_WIDTH;
+    const height = graphNode.measured?.height ?? 260;
+    const zoom = Math.max(.62, Math.min(.92, instance?.getZoom() ?? (compact ? .68 : .82)));
+    void instance?.setCenter(graphNode.position.x + width / 2, graphNode.position.y + height / 2, { zoom, duration: 420 });
+  }, [activeFile, behaviorOwnership, compact, graphMode, selectSystemBehavior, visibleGraph.nodes]);
+
   const navigateDependency = useCallback((direction: -1 | 1) => {
     if (!dependencyNavigationEdges.length) return;
     const current = selectedDependencyIndex < 0 ? (direction > 0 ? -1 : 0) : selectedDependencyIndex;
@@ -3453,10 +3872,6 @@ export default function Home() {
     const endpointNodes = [instance?.getNode(edge.source), instance?.getNode(edge.target)].filter((node): node is Node => Boolean(node));
     if (endpointNodes.length) void instance?.fitView({ nodes: endpointNodes, padding: .3, maxZoom: .9, duration: 480 });
   }, [dependencyNavigationEdges, selectedDependencyIndex]);
-
-  const fitWholeGraph = useCallback(() => {
-    void graphInstanceRef.current?.fitView({ padding: .12, minZoom: .06, maxZoom: .82, duration: 620 });
-  }, []);
 
   const chooseStage = useCallback((next: ReviewStage) => {
     if (next === "change" && !baselineReady) return;
@@ -3653,56 +4068,43 @@ export default function Home() {
     event.target.value = "";
   }, [importRepositoryFiles]);
 
-  const graphTitle = stage === "baseline" ? "How the existing code works" : "What the change does to that system";
-  const graphSubtitle = stage === "baseline"
-    ? "Responsibilities, request flow, decisions, outputs, configuration, and evidence."
-    : "Every changed line is attached to an exact before-to-after behavior.";
+  const toggleGraphExtension = useCallback((extension: string) => {
+    setHiddenExtensions((current) => {
+      const next = new Set(current);
+      if (next.has(extension)) next.delete(extension);
+      else next.add(extension);
+      return next;
+    });
+    setFocusedNodeId(null);
+    setSelectedDependencyEdgeId(null);
+    setHoveredEdgeId(null);
+    setCodePanelOpen(false);
+  }, []);
+
+  const showAllGraphExtensions = useCallback(() => {
+    setHiddenExtensions(new Set());
+    setFocusedNodeId(null);
+    setSelectedDependencyEdgeId(null);
+    setHoveredEdgeId(null);
+  }, []);
+
   const focusedSystemNode = graphMode === "behavior" && focusedNodeId ? analysis.nodes.find((node) => node.id === focusedNodeId) : null;
-  const hierarchyLabel = graphMode === "behavior" ? "System behavior HLD" : selectedFile ? "File behaviors" : selectedModule ? "Module files" : selectedSubsystem ? "Subsystem modules" : stage === "baseline" ? "System overview" : "Change overview";
-  const hierarchyTitle = graphMode === "behavior" ? activeSystemJourney?.title ?? "End-to-end system journeys" : selectedFile?.title ?? selectedModule?.title ?? selectedSubsystem?.title ?? graphTitle;
-  const hierarchyDescription = graphMode === "behavior"
-    ? activeSystemJourney
-      ? `${activeSystemJourney.description}. Connected steps stay together while you inspect individual tiles.`
-      : `${systemJourneys.length} distinct end-to-end journeys grouped from ${analysis.nodes.length} mapped behaviors. The project explorer still contains every behavior.`
-    : selectedFile
-      ? `${selectedFile.nodes.length} behaviors owned by ${selectedFile.path}. Select one for exact code evidence.`
-      : selectedModule
-        ? `${selectedModule.files.length} files in ${selectedModule.path}. Open a file to understand its responsibilities.`
-        : selectedSubsystem
-          ? `${selectedSubsystem.modules.length} modules in ${selectedSubsystem.path}. The graph now follows the project folder structure.`
-          : graphSubtitle;
   const showActivity = Boolean(agentJob && agentJob.status !== "complete");
   const showActivityPanel = showActivity && activityPanelOpen;
 
   return (
     <main className="product-shell">
-      <header className="topbar">
-        <div className="brand-lockup">
-          <span className="brand-mark">CG</span>
-          <div><strong>ChangeGraph</strong><small>Understand code before approving it</small></div>
-        </div>
-
-        <div className="project-identity">
-          <span>{stage === "baseline" ? "Understanding" : "Reviewing change in"}</span>
-          <strong>{repository?.name ?? "Pricing service example"}</strong>
-        </div>
-
-        <div className="stage-switch" aria-label="Understanding workflow">
-          <button type="button" className={stage === "baseline" ? "active" : ""} onClick={() => chooseStage("baseline")} aria-label="Existing code baseline" title="Existing code baseline">
-            <span><BookOpen aria-hidden="true" /></span><strong>Baseline</strong><small>Existing code</small>
-          </button>
-          <button type="button" className={stage === "change" ? "active" : ""} disabled={!baselineReady} onClick={() => chooseStage("change")} aria-label="Change review" title="Change review">
-            <span><GitCompareArrows aria-hidden="true" /></span><strong>Change</strong><small>Diff review</small>
-          </button>
-        </div>
-
-        <div className="topbar-status">
-          <span className="status-dot" />
-          <div><strong>{analysis.classified} / {analysis.inventory.length}</strong><small>{stage === "baseline" ? "source lines mapped" : "changed lines explained"}</small></div>
-        </div>
-      </header>
-
       <nav className="view-tabs" aria-label="Workspace views">
+        <div className="rail-brand" title="ChangeGraph">
+          <span className="brand-mark">CG</span>
+          <div><strong>{repository?.name ?? "ChangeGraph"}</strong><small>{stage === "baseline" ? "Understanding" : "Reviewing change"}</small></div>
+          <span className="sr-only">Understand code before approving it</span>
+        </div>
+        <div className="rail-control-group rail-stage-switch" aria-label="Understanding workflow">
+          <button type="button" className={stage === "baseline" ? "active" : ""} onClick={() => chooseStage("baseline")} aria-label="Existing code baseline" title="Existing code baseline"><BookOpen aria-hidden="true" /><span>Baseline</span></button>
+          <button type="button" className={stage === "change" ? "active" : ""} disabled={!baselineReady} onClick={() => chooseStage("change")} aria-label="Change review" title="Change review"><GitCompareArrows aria-hidden="true" /><span>Change</span></button>
+        </div>
+        <span className="rail-divider" aria-hidden="true" />
         <button type="button" className={mobilePanel === "input" ? "active" : ""} onClick={() => setMobilePanel("input")} title={stage === "baseline" ? "Repository" : "Diff"}>
           {stage === "baseline" ? <FolderGit2 aria-hidden="true" /> : <GitCompareArrows aria-hidden="true" />}
           <strong>{stage === "baseline" ? "Repository" : "Diff"}</strong>
@@ -3715,6 +4117,19 @@ export default function Home() {
           <FileSearch2 aria-hidden="true" />
           <strong>Explain</strong>
         </button>
+        {mobilePanel === "graph" ? (
+          <>
+            <span className="rail-divider" aria-hidden="true" />
+            <div className="rail-control-group rail-graph-modes" role="tablist" aria-label="Choose graph perspective">
+              <button type="button" role="tab" aria-selected={graphMode === "structure"} className={graphMode === "structure" ? "active" : ""} onClick={() => chooseGraphMode("structure")} title="Project structure"><FolderTree aria-hidden="true" /><span>Structure</span></button>
+              <button type="button" role="tab" aria-selected={graphMode === "behavior"} className={graphMode === "behavior" ? "active" : ""} onClick={() => chooseGraphMode("behavior")} title="End-to-end system behavior"><Workflow aria-hidden="true" /><span>Behavior</span></button>
+            </div>
+          </>
+        ) : null}
+        <div className="rail-status" title={`${analysis.classified} of ${analysis.inventory.length} ${stage === "baseline" ? "source lines mapped" : "changed lines explained"}`}>
+          <span className="status-dot" />
+          <strong>{analysis.classified}<small> / {analysis.inventory.length}</small></strong>
+        </div>
       </nav>
 
       <div className={`single-workspace mobile-panel-${mobilePanel}`}>
@@ -3792,27 +4207,6 @@ export default function Home() {
         </section>
 
         <section className="map-view" aria-label="Semantic code graph">
-          <header className={`map-toolbar ${graphMode === "behavior" ? "behavior-map-toolbar" : ""}`}>
-            <div>
-              <span className="section-label">{hierarchyLabel}</span>
-              <h1>{hierarchyTitle}</h1>
-              <p>{hierarchyDescription}</p>
-            </div>
-            <div className="graph-mode-tabs" role="tablist" aria-label="Choose graph perspective">
-              <button type="button" role="tab" aria-selected={graphMode === "structure"} className={graphMode === "structure" ? "active" : ""} onClick={() => chooseGraphMode("structure")}>
-                <FolderTree aria-hidden="true" /><span>Structure</span><small>Project hierarchy</small>
-              </button>
-              <button type="button" role="tab" aria-selected={graphMode === "behavior"} className={graphMode === "behavior" ? "active" : ""} onClick={() => chooseGraphMode("behavior")}>
-                <Workflow aria-hidden="true" /><span>System behavior</span><small>End-to-end HLD</small>
-              </button>
-            </div>
-            <div className="map-actions">
-              {agentJob ? <span className={`agent-job-badge agent-${agentJob.status}`} title={agentJob.status === "complete" ? "Agent map ready" : `${agentJob.completed}/${agentJob.total} analysis work units complete`}>{agentJob.status === "complete" ? "Agent map ready" : `${agentJob.completed}/${agentJob.total} agent work units`}</span> : null}
-              {stage === "change" ? <span className="context-badge">Uses {baseline.nodes.length} baseline concepts</span> : null}
-              <span className={`coverage-badge ${analysis.unknown ? "warning" : ""}`}>{analysis.unknown ? `${analysis.unknown} need inspection` : "Complete line coverage"}</span>
-              {(graphMode === "behavior" ? focusedSystemNode : selectedFile) ? <button type="button" className="compact-action" onClick={() => setMobilePanel("inspect")} aria-label="Explain selected" title="Explain selected"><FileSearch2 aria-hidden="true" /><span>Explain</span></button> : <span className="hierarchy-hint">{graphMode === "behavior" ? "Select a behavior" : selectedModule ? "Open a file" : selectedSubsystem ? "Open a module" : "Open a subsystem"}</span>}
-            </div>
-          </header>
           <div className={`map-body ${showActivityPanel ? "has-activity" : ""}`}>
             {graphMode === "structure" ? <aside className="hierarchy-panel" aria-label="Code hierarchy">
               <header><span>Code structure</span><strong>System → subsystem → module → file → behavior → code</strong></header>
@@ -3870,7 +4264,6 @@ export default function Home() {
                     {focusedNodeId && selectedFile ? <span className="dependency-lens-pill"><i />Dependency lens: {selectedNode?.data.codeIdentity || selectedNode?.data.title}</span> : null}
                   </>
                 )}
-                <button type="button" className="fit-graph-button compact-action" onClick={fitWholeGraph} aria-label="Fit the complete visible graph on screen" title="Fit whole graph"><Maximize2 aria-hidden="true" /><span>Fit graph</span></button>
                 {graphMode === "structure" && !selectedFile && focusedNodeIndex >= 0 && orderedVisibleNodes.length > 1 ? (
                   <div className="node-sequence-nav" aria-label="Navigate visible tiles">
                     <span aria-live="polite">{focusedNodeIndex + 1} of {orderedVisibleNodes.length}</span>
@@ -3887,20 +4280,7 @@ export default function Home() {
                     <small className={`journey-order-status status-${journeyOrderStatus}`}>{demoMode ? "Deterministic reading order" : journeyOrderStatus === "ordering" ? "AI is ordering the reading path…" : journeyOrderStatus === "ready" ? "AI reading order ready" : journeyOrderStatus === "error" ? "Using safe reading order" : "Reading order available"}</small>
                   </div>
                   <button type="button" className="icon-button" onClick={() => navigateSystemBehavior(-1)} disabled={activeSystemJourneyIndex <= 0} aria-label="Previous system journey" title="Previous journey"><ChevronLeft aria-hidden="true" /></button>
-                  <label>
-                    <span>Jump to a complete journey</span>
-                    <select value={activeSystemJourney?.id ?? ""} onChange={(event) => selectSystemJourney(event.target.value)}>
-                      <option value="" disabled>Choose an end-to-end journey…</option>
-                      {systemJourneyGroups.map((group) => (
-                        <optgroup key={group.phase} label={journeyPhaseLabel(group.phase)}>
-                          {group.journeys.map((journey) => {
-                            const index = systemJourneys.findIndex((candidate) => candidate.id === journey.id);
-                            return <option key={journey.id} value={journey.id}>{index + 1}. {journey.title} — {journey.description}</option>;
-                          })}
-                        </optgroup>
-                      ))}
-                    </select>
-                  </label>
+                  <JourneyPicker groups={systemJourneyGroups} activeJourneyId={activeSystemJourney?.id} onSelect={selectSystemJourney} />
                   <button type="button" className="icon-button" onClick={() => navigateSystemBehavior(1)} disabled={activeSystemJourneyIndex >= systemJourneys.length - 1} aria-label="Next system journey" title="Next journey"><ChevronRight aria-hidden="true" /></button>
                   {activeSystemJourney ? <button type="button" className="hld-overview-button compact-action" onClick={() => { setFocusedNodeId(null); setSelectedDependencyEdgeId(null); }} aria-label="Return to system behavior overview" title="HLD overview"><LayoutDashboard aria-hidden="true" /><span>Overview</span></button> : null}
                   {activeSystemJourney && activeJourneySteps.length ? (
@@ -3939,7 +4319,7 @@ export default function Home() {
                 </div>
               ) : null}
               <div className={`graph-workspace ${codePanelOpen && selectedNode ? "with-code-panel" : ""}`}>
-              <div className={`map-canvas graph-zoom-${zoomMode}`}>
+              <div ref={graphCanvasRef} className={`map-canvas graph-zoom-${zoomMode}`}>
                 <ReactFlow
                   key={`${stage}-${graphMode}`}
                   nodes={renderedNodes}
@@ -3984,17 +4364,22 @@ export default function Home() {
                     if (graphMode === "structure" && !selectedFile) setFocusedNodeId(null);
                     setHoveredEdgeId(null);
                     setSelectedDependencyEdgeId(null);
+                    setExtensionFilterOpen(false);
                   }}
-                  onMove={(_, viewport) => setZoomMode((current) => {
-                    const next = graphZoomMode(viewport.zoom);
-                    return current === next ? current : next;
-                  })}
+                  onMove={(_, viewport) => {
+                    setZoomMode((current) => {
+                      const next = graphZoomMode(viewport.zoom);
+                      return current === next ? current : next;
+                    });
+                    graphCanvasRef.current?.style.setProperty("--edge-label-scale", String(1 / Math.max(.06, viewport.zoom)));
+                  }}
                   onInit={(instance) => {
                     graphInstanceRef.current = instance as unknown as ReactFlowInstance;
                     const root = visibleGraph.nodes[0];
                     const initialZoom = compact ? .68 : .82;
                     setZoomMode(graphZoomMode(initialZoom));
-                    void instance.setCenter(650, root.position.y + 100, { zoom: initialZoom, duration: 0 });
+                    graphCanvasRef.current?.style.setProperty("--edge-label-scale", String(1 / initialZoom));
+                    if (root) void instance.setCenter(650, root.position.y + 100, { zoom: initialZoom, duration: 0 });
                   }}
                   minZoom={0.06}
                   maxZoom={3.2}
@@ -4012,6 +4397,59 @@ export default function Home() {
                   <Background color="#3C3C3C" gap={32} size={1} variant={BackgroundVariant.Dots} />
                   <Controls showInteractive={false} fitViewOptions={{ padding: .12, minZoom: .06, maxZoom: .82, duration: 620 }} />
                 </ReactFlow>
+                <div className={`graph-extension-filter ${extensionFilterOpen ? "is-open" : ""}`}>
+                  <button
+                    type="button"
+                    className="graph-extension-filter-trigger"
+                    aria-label={activeHiddenExtensionCount ? `File type filter, ${activeHiddenExtensionCount} hidden` : "Filter graph by file type"}
+                    aria-haspopup="dialog"
+                    aria-expanded={extensionFilterOpen}
+                    title="Filter graph by file type"
+                    onClick={() => setExtensionFilterOpen((current) => !current)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setExtensionFilterOpen(false);
+                    }}
+                  >
+                    <ListFilter aria-hidden="true" />
+                    {activeHiddenExtensionCount ? <b>{activeHiddenExtensionCount}</b> : null}
+                  </button>
+                  {extensionFilterOpen ? (
+                    <aside className="graph-extension-filter-popover" role="dialog" aria-label="File type visibility">
+                      <header>
+                        <div><strong>File types</strong><small>Choose which nodes appear</small></div>
+                        <button type="button" className="icon-button" onClick={() => setExtensionFilterOpen(false)} aria-label="Close file type filter"><X aria-hidden="true" /></button>
+                      </header>
+                      <div className="graph-extension-options">
+                        {extensionOptions.map((option) => {
+                          const visible = !hiddenExtensions.has(option.extension);
+                          return (
+                            <label key={option.extension} className={visible ? "" : "is-hidden"}>
+                              <input
+                                type="checkbox"
+                                checked={visible}
+                                onChange={() => toggleGraphExtension(option.extension)}
+                              />
+                              <span>{option.label}</span>
+                              <small>{option.count} node{option.count === 1 ? "" : "s"}</small>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      <footer>
+                        <span aria-live="polite">{analysis.nodes.length - graphAnalysis.nodes.length} hidden</span>
+                        <button type="button" onClick={showAllGraphExtensions} disabled={!activeHiddenExtensionCount}><RotateCcw aria-hidden="true" />Show all</button>
+                      </footer>
+                    </aside>
+                  ) : null}
+                </div>
+                {!visibleGraph.nodes.length ? (
+                  <div className="graph-filter-empty" role="status">
+                    <ListFilter aria-hidden="true" />
+                    <strong>No visible nodes</strong>
+                    <span>Every file type in this view is hidden.</span>
+                    <button type="button" onClick={showAllGraphExtensions}>Show all file types</button>
+                  </div>
+                ) : null}
                 {selectedDependency ? (
                   <aside className={`dependency-inspector scope-${selectedDependency.scope}`} aria-label={`${selectedDependency.scope === "same-file" ? "Same-file" : "Cross-file"} dependency details`}>
                     <header>
@@ -4019,12 +4457,22 @@ export default function Home() {
                       <button type="button" className="icon-button" onClick={() => setSelectedDependencyEdgeId(null)} aria-label="Close dependency details" title="Close dependency details"><X aria-hidden="true" /></button>
                     </header>
                     <div className="dependency-summary"><b>{selectedDependency.count}</b><span>{selectedDependency.primaryLabel.toLowerCase()} relationship{selectedDependency.count === 1 ? "" : "s"}</span></div>
+                    <nav className="dependency-endpoints" aria-label="Navigate edge endpoints">
+                      <button type="button" onClick={() => focusDependencyEndpoint(selectedDependency.source)} title={`Focus source node: ${selectedDependency.sourceTitle}`}>
+                        <ChevronLeft aria-hidden="true" />
+                        <span><small>Source</small><strong>{selectedDependency.sourceTitle}</strong></span>
+                      </button>
+                      <button type="button" onClick={() => focusDependencyEndpoint(selectedDependency.target)} title={`Focus target node: ${selectedDependency.targetTitle}`}>
+                        <span><small>Target</small><strong>{selectedDependency.targetTitle}</strong></span>
+                        <ChevronRight aria-hidden="true" />
+                      </button>
+                    </nav>
                     <ol>
                       {selectedDependency.members.slice(0, 8).map((member, index) => (
                         <li key={`${member.source}-${member.target}-${index}`}>
                           <span>{member.plainLabel}</span>
                           <strong>{member.sourceTitle} → {member.targetTitle}</strong>
-                          <small>{member.sourceFile} → {member.targetFile}</small>
+                          <small>{member.sourceFile === member.targetFile ? member.sourceFile : `${member.sourceFile} → ${member.targetFile}`}</small>
                         </li>
                       ))}
                     </ol>
@@ -4068,17 +4516,17 @@ export default function Home() {
                 <button type="button" onClick={() => setMobilePanel("graph")}>← Back to map</button>
                 <div className="explain-tags"><span className={`kind-tag kind-${selectedNode.data.kind}`}>{selectedNode.data.kind}</span><span>{selectedNode.data.confidence} confidence</span><span>{selectedNode.data.lineIds.length} owned lines</span></div>
                 <h1>{selectedNode.data.title}</h1>
-                <p>{selectedNode.data.summary}</p>
+                <BehaviorPointList text={selectedNode.data.summary} className="explain-behavior-points" ariaLabel={`${selectedNode.data.title} behavior summary`} />
               </header>
 
               <div className="explain-content">
                 <aside className="meaning-pane">
                   <span className="section-label">{stage === "baseline" ? "Existing behavior" : "Behavior change"}</span>
-                  {stage === "baseline" ? <p>{selectedNode.data.summary}</p> : (
+                  {stage === "baseline" ? <BehaviorPointList text={selectedNode.data.summary} className="meaning-behavior-points" ariaLabel="Existing behavior" /> : (
                     <div className="before-after">
-                      <div><span>Before</span><strong>{selectedNode.data.before}</strong></div>
+                      <div><span>Before</span><BehaviorPointList text={selectedNode.data.before} ariaLabel="Behavior before this change" /></div>
                       <b>↓</b>
-                      <div><span>After</span><strong>{selectedNode.data.after}</strong></div>
+                      <div><span>After</span><BehaviorPointList text={selectedNode.data.after} ariaLabel="Behavior after this change" /></div>
                     </div>
                   )}
                   <details className="line-ledger">
