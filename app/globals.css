@@ -3591,14 +3591,18 @@ label,
   max-height: min(520px, calc(100vh - 100px));
   padding: 7px;
   overflow: auto;
-  border: 1px solid rgba(174, 176, 188, .28);
+  border: 1px solid rgba(196, 198, 210, .3);
   border-radius: 12px;
   background:
-    linear-gradient(145deg, rgba(255, 255, 255, .07), rgba(255, 255, 255, .015) 42%, rgba(155, 140, 255, .035)),
-    rgba(27, 28, 32, .68);
-  -webkit-backdrop-filter: blur(24px) saturate(145%);
-  backdrop-filter: blur(24px) saturate(145%);
-  box-shadow: 0 22px 70px rgba(0, 0, 0, .48), inset 0 1px 0 rgba(255, 255, 255, .07);
+    linear-gradient(145deg, rgba(255, 255, 255, .09), rgba(255, 255, 255, .025) 42%, rgba(155, 140, 255, .055)),
+    rgba(25, 26, 30, .955);
+  -webkit-backdrop-filter: blur(38px) saturate(90%) brightness(72%);
+  backdrop-filter: blur(38px) saturate(90%) brightness(72%);
+  box-shadow:
+    0 24px 76px rgba(0, 0, 0, .62),
+    inset 0 1px 0 rgba(255, 255, 255, .09),
+    inset 0 0 0 1px rgba(255, 255, 255, .018);
+  isolation: isolate;
   scrollbar-color: rgba(190, 191, 201, .48) transparent;
   scrollbar-width: thin;
 }
@@ -3610,8 +3614,9 @@ label,
   top: -7px;
   padding: 7px 9px;
   border-radius: 7px;
-  background: rgba(255, 255, 255, .075);
-  color: var(--slate-10);
+  border: 1px solid rgba(255, 255, 255, .045);
+  background: rgba(61, 62, 69, .94);
+  color: var(--slate-11);
   font: 700 9px/1 var(--mono);
   letter-spacing: .08em;
   text-transform: uppercase;
@@ -3627,20 +3632,21 @@ label,
   padding: 8px 9px;
   border: 1px solid transparent;
   border-radius: 8px;
-  background: transparent;
-  color: var(--slate-11);
+  background: rgba(15, 16, 20, .3);
+  color: var(--slate-12);
   text-align: left;
   cursor: pointer;
 }
 .journey-picker-group > button:hover,
 .journey-picker-group > button:focus-visible {
   outline: none;
-  background: rgba(255, 255, 255, .07);
+  border-color: rgba(255, 255, 255, .07);
+  background: rgba(255, 255, 255, .085);
   color: var(--slate-12);
 }
 .journey-picker-group > button.active {
-  border-color: rgba(155, 140, 255, .38);
-  background: rgba(155, 140, 255, .13);
+  border-color: rgba(155, 140, 255, .5);
+  background: rgba(155, 140, 255, .19);
   color: var(--slate-12);
 }
 .journey-picker-group > button > span {
@@ -3659,8 +3665,12 @@ label,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.journey-picker-group strong { font: 650 12px/1.2 var(--sans); }
-.journey-picker-group small { color: var(--slate-9); font: 500 10px/1.2 var(--sans); }
+.journey-picker-group strong { font: 650 13px/1.2 var(--sans); }
+.journey-picker-group small { color: var(--slate-10); font: 500 10.5px/1.25 var(--sans); }
+
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .journey-picker-menu { background: rgb(31, 32, 37); }
+}
 .system-behavior-toolbar > button,
 .system-behavior-toolbar .journey-step-nav,
 .system-behavior-toolbar .gallery-dependency-nav {
