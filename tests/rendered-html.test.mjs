@@ -192,9 +192,15 @@ test("keeps both AI provider paths explicit", async () => {
   assert.match(route, /what starts this behavior/);
   assert.match(route, /repository-wide architecture pass/);
   assert.match(route, /frontend requests/);
-  assert.match(bridge, /semantic-v9-multi-axis-journeys/);
+  assert.match(bridge, /semantic-v11-validated-compact-evidence/);
+  assert.match(bridge, /validateAnalysisCoverage/);
+  assert.match(bridge, /completeAnalysisCoverage/);
+  assert.match(bridge, /Evidence needs classification/);
+  assert.match(route, /semantic_coverage_repair/);
   assert.match(bridge, /4-7 ordered bullet points/);
   assert.match(route, /database tables or collections/);
+  assert.match(route, /CHANGEGRAPH_EXTRACTION_REASONING/);
+  assert.match(page, /MAX_AMBIGUOUS_INTEGRATION_WINDOWS = 20/);
   assert.match(route, /buildJourneyOrderingPrompt/);
   assert.match(route, /journey_reading_order/);
   assert.match(route, /journey_stage_order/);
@@ -206,7 +212,7 @@ test("keeps both AI provider paths explicit", async () => {
   assert.match(bridge, /CHANGEGRAPH_CODEX_TIMEOUT_MS/);
   assert.match(bridge, /plain, simple English/);
   assert.match(bridge, /what happens step by step/);
-  assert.match(bridge, /semantic-v9-multi-axis-journeys/);
+  assert.match(bridge, /semantic-v11-validated-compact-evidence/);
   assert.match(bridge, /flowRole/);
   assert.match(bridge, /boundaryRefs/);
   assert.match(bridge, /excludedNodes/);

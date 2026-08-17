@@ -230,7 +230,7 @@ type AiAnalysis = {
 type AnalysisBatch = {
   id: string;
   files: string[];
-  inventory: Array<Pick<CodeLine, "id" | "file" | "lineNumber" | "side">>;
+  inventory: Array<Pick<CodeLine, "id" | "file" | "lineNumber" | "side"> & { ref: string }>;
   content: string;
 };
 
@@ -256,12 +256,13 @@ const CODE_EXTENSIONS = new Set([
 ]);
 const SKIPPED_DIRECTORIES = new Set([".git", ".next", ".turbo", ".venv", "build", "coverage", "dist", "node_modules", "out", "target", "vendor"]);
 const LOCAL_CODEX_BRIDGE = "http://127.0.0.1:47831";
-const TARGET_BATCH_CHARACTERS = 64_000;
-const TARGET_BATCH_LINES = 900;
-const PARALLEL_ANALYSIS_WORKERS = 4;
-const PARALLEL_INTEGRATION_WORKERS = 3;
+const TARGET_BATCH_CHARACTERS = 12_000;
+const TARGET_BATCH_LINES = 120;
+const PARALLEL_ANALYSIS_WORKERS = 6;
+const PARALLEL_INTEGRATION_WORKERS = 4;
+const MAX_AMBIGUOUS_INTEGRATION_WINDOWS = 20;
 const ANALYSIS_CACHE = "changegraph-analysis-v2";
-const PROMPT_VERSION = "semantic-v9-multi-axis-journeys";
+const PROMPT_VERSION = "semantic-v11-validated-compact-evidence";
 const JOURNEY_ORDERING_VERSION = "journey-reading-order-v2-multi-axis";
 
 async function localBridgeIsReady() {
@@ -325,43 +326,28 @@ function buildAnalysisBatches(inventory: CodeLine[]): AnalysisBatch[] {
   const byFile = new Map<string, CodeLine[]>();
   for (const line of inventory) byFile.set(line.file, [...(byFile.get(line.file) ?? []), line]);
 
-  const fileSegments: CodeLine[][] = [];
+  const batches: CodeLine[][] = [];
   for (const lines of byFile.values()) {
     let segment: CodeLine[] = [];
     let characters = 0;
     for (const line of lines) {
-      const lineSize = line.id.length + line.text.length + 8;
+      const lineSize = line.text.length + 16;
       if (segment.length && (segment.length >= TARGET_BATCH_LINES || characters + lineSize > TARGET_BATCH_CHARACTERS)) {
-        fileSegments.push(segment);
+        batches.push(segment);
         segment = [];
         characters = 0;
       }
       segment.push(line);
       characters += lineSize;
     }
-    if (segment.length) fileSegments.push(segment);
+    if (segment.length) batches.push(segment);
   }
-
-  const batches: CodeLine[][] = [];
-  let current: CodeLine[] = [];
-  let characters = 0;
-  for (const segment of fileSegments) {
-    const segmentCharacters = segment.reduce((total, line) => total + line.id.length + line.text.length + 8, 0);
-    if (current.length && (current.length + segment.length > TARGET_BATCH_LINES || characters + segmentCharacters > TARGET_BATCH_CHARACTERS)) {
-      batches.push(current);
-      current = [];
-      characters = 0;
-    }
-    current.push(...segment);
-    characters += segmentCharacters;
-  }
-  if (current.length) batches.push(current);
 
   return batches.map((lines, index) => ({
     id: `work-${index + 1}-${lines[0].file}-${lines[0].lineNumber}`,
     files: [...new Set(lines.map((line) => line.file))],
-    inventory: lines.map(({ id, file, lineNumber, side }) => ({ id, file, lineNumber, side })),
-    content: lines.map((line) => `[${line.id}] ${line.text}`).join("\n"),
+    inventory: lines.map(({ id, file, lineNumber, side }, lineIndex) => ({ id, ref: `L${String(lineIndex + 1).padStart(4, "0")}`, file, lineNumber, side })),
+    content: lines.map((line, lineIndex) => `[L${String(lineIndex + 1).padStart(4, "0")}] ${line.text}`).join("\n"),
   }));
 }
 
@@ -3961,7 +3947,7 @@ export default function Home() {
         });
 
         let merged = mergeAiAnalyses(analyses);
-        const integrationWindows = buildIntegrationWindows(merged.nodes);
+        const integrationWindows = buildIntegrationWindows(merged.nodes).slice(0, MAX_AMBIGUOUS_INTEGRATION_WINDOWS);
         if (integrationWindows.length) {
           setProgressStep(2);
           let connected = 0;

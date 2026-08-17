@@ -12,8 +12,11 @@
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
-    "codex:bridge": "node local-bridge/server.mjs",
-    "changegraph:service": "node local-bridge/server.mjs"
+    "codex:bridge": "node --env-file-if-exists=.env.local local-bridge/server.mjs",
+    "changegraph:service": "node --env-file-if-exists=.env.local local-bridge/server.mjs",
+    "pipeline:benchmark": "node scripts/benchmark-pipeline.mjs",
+    "pipeline:compare": "node scripts/compare-graphs.mjs",
+    "pipeline:coverage-rca": "node scripts/coverage-rca.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

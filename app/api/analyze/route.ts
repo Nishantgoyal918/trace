@@ -1,5 +1,6 @@
 type InventoryLine = {
   id: string;
+  ref?: string;
   file: string;
   lineNumber: number;
   text?: string;
@@ -9,6 +10,7 @@ type InventoryLine = {
 type ReviewMode = "baseline" | "change";
 
 const SEMANTIC_KINDS = ["structure", "contract", "flow", "routing", "error", "fallback", "state", "output", "config", "test", "unknown"];
+const LINE_REF_PATTERN = "^L[0-9]{4}(?:-L[0-9]{4})?$";
 
 const ANALYSIS_SCHEMA = {
   type: "object",
@@ -20,7 +22,7 @@ const ANALYSIS_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["id", "title", "codeIdentity", "kind", "summary", "before", "after", "lineIds", "confidence", "provides", "uses"],
+        required: ["id", "title", "codeIdentity", "kind", "summary", "before", "after", "lineRefs", "confidence", "provides", "uses"],
         properties: {
           id: { type: "string" },
           title: { type: "string" },
@@ -29,7 +31,7 @@ const ANALYSIS_SCHEMA = {
           summary: { type: "string", description: "Four to seven complete plain-English bullet points separated by newlines; every line starts with - " },
           before: { type: "string", description: "For change analysis, two to five complete prior-behavior bullet points separated by newlines; empty for baseline" },
           after: { type: "string", description: "For change analysis, two to five complete new-behavior bullet points separated by newlines; empty for baseline" },
-          lineIds: { type: "array", items: { type: "string" } },
+          lineRefs: { type: "array", items: { type: "string", pattern: LINE_REF_PATTERN } },
           confidence: { type: "string", enum: ["high", "medium", "low"] },
           provides: { type: "array", items: { type: "string" } },
           uses: { type: "array", items: { type: "string" } },
@@ -49,6 +51,28 @@ const ANALYSIS_SCHEMA = {
         },
       },
     },
+  },
+};
+
+const REPAIR_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["existingAssignments", "newNodes", "edges"],
+  properties: {
+    existingAssignments: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["nodeId", "lineRefs"],
+        properties: {
+          nodeId: { type: "string" },
+          lineRefs: { type: "array", items: { type: "string", pattern: LINE_REF_PATTERN } },
+        },
+      },
+    },
+    newNodes: ANALYSIS_SCHEMA.properties.nodes,
+    edges: ANALYSIS_SCHEMA.properties.edges,
   },
 };
 
@@ -208,17 +232,17 @@ Analysis mode: ${mode}
 ${mode === "baseline" ? baselineRules : changeRules}
 
 Rules:
-1. Assign every bracketed source line ID to exactly one semantic node.
-2. Use only supplied bracketed line IDs. Never invent or duplicate them.
-3. Each supplied code line is formatted as [inventory-id] exact text; the bracketed prefix is metadata, not source code.
+1. Assign every bracketed local line reference to exactly one semantic node.
+2. Use only supplied L0001 references. A contiguous inclusive span may be written as L0001-L0004. Never invent or duplicate references.
+3. Each supplied code line is formatted as [L0001] exact text; the bracketed prefix is metadata, not source code. Never return a file path, source: identifier, inventory-id, inventory-N, or bare line number in lineRefs.
 4. Use short, concrete, outcome-oriented titles. Avoid vague labels such as "updated logic".
 5. Put unclear lines in an unknown node with low confidence instead of hiding them.
 6. Add directed edges only for concrete containment, flow, dependency, routing, configuration, fallback, or test relationships.
-7. Write each summary as 4-7 ordered bullet points in plain, simple English, normally 60-140 words total. Encode the bullets inside the JSON string as newline-separated lines, and start every line with "- ". Each bullet must be a complete, direct subject-verb-object sentence, not a fragment.
+7. Write each summary as 4-7 ordered bullet points in plain, simple English, normally 45-110 words total. Encode the bullets inside the JSON string as newline-separated lines, and start every line with "- ". Each bullet must be a complete, direct subject-verb-object sentence, not a fragment.
 8. Preserve the whole behavioral explanation across the bullets. The points must answer what starts this behavior, what happens step by step, which decisions or branches alter the path, which collaborators or state participate, what result or side effect occurs, and what error or fallback applies. Omit only categories that truly do not exist. Define unavoidable project terms in place and avoid unexplained jargon or acronyms.
 9. Do not say code merely "handles", "manages", "processes", or "orchestrates" something. Name the concrete actions, conditions, collaborators, and outcomes instead.
 10. For change mode, write before and after as 2-5 complete, specific bullet points each, using newline-separated "- " lines and 30-100 words per field. Keep points in execution order and make the behavioral difference understandable without reading the source. For baseline mode, keep both empty.
-11. Group related lines into 8-24 coherent behaviors rather than emitting one node per small syntax block. Do not combine unrelated functions only to reduce the node count.
+11. Create one behavior for every coherent named code boundary or distinct observable path. Never merge separate functions, triggers, branches, errors, fallbacks, state effects, or results merely to reduce node count. There is no target node count.
 12. Keep titles under 8 words. Detail belongs in the bullet points in summary, before, and after; never drop useful behavior merely to shorten a card.
 13. Set codeIdentity to the exact function, method, class, component, route, heading, configuration section, or other named code boundary being explained. Include the filename when it improves clarity.
 14. Describe behavior rather than translating syntax line by line. A reader should understand why the code exists and what observable result it creates.
@@ -265,6 +289,142 @@ ${architectureRules}
 
 Concepts:
 ${JSON.stringify(nodes)}`;
+}
+
+type RawNode = {
+  id: string;
+  title: string;
+  codeIdentity: string;
+  kind: string;
+  summary: string;
+  before: string;
+  after: string;
+  lineRefs?: string[];
+  lineIds?: string[];
+  confidence: string;
+  provides: string[];
+  uses: string[];
+};
+type RawEdge = { source: string; target: string; label: string };
+type RawAnalysis = { nodes?: RawNode[]; edges?: RawEdge[] };
+type RepairResult = { existingAssignments?: Array<{ nodeId: string; lineRefs: string[] }>; newNodes?: RawNode[]; edges?: RawEdge[] };
+
+function compactLineRef(index: number) {
+  return `L${String(index + 1).padStart(4, "0")}`;
+}
+
+function compactRequest(content: string, inventory: InventoryLine[]) {
+  const compactInventory = inventory.map((line, index) => ({ ...line, ref: line.ref || compactLineRef(index) }));
+  const refById = new Map(compactInventory.map((line) => [line.id, line.ref]));
+  const compactContent = content.split("\n").map((line) => {
+    if (!line.startsWith("[")) return line;
+    const end = line.indexOf("] ");
+    if (end < 2) return line;
+    const id = line.slice(1, end);
+    return refById.has(id) ? `[${refById.get(id)}]${line.slice(end + 1)}` : line;
+  }).join("\n");
+  return { content: compactContent, inventory: compactInventory };
+}
+
+function expandLineRefs(values: string[] | undefined, inventory: InventoryLine[]) {
+  const refIndex = new Map(inventory.map((line, index) => [line.ref || compactLineRef(index), index]));
+  const validIds = new Set(inventory.map((line) => line.id));
+  const ids: string[] = [];
+  let invalid = 0;
+  for (const value of values ?? []) {
+    if (validIds.has(value)) {
+      ids.push(value);
+      continue;
+    }
+    const match = value.match(/^(L\d{4})(?:-(L\d{4}))?$/);
+    const start = match ? refIndex.get(match[1]) : undefined;
+    const end = match ? refIndex.get(match[2] || match[1]) : undefined;
+    if (!match || start === undefined || end === undefined || end < start) {
+      invalid += 1;
+      continue;
+    }
+    for (let index = start; index <= end; index += 1) ids.push(inventory[index].id);
+  }
+  return { ids, invalid };
+}
+
+function validateCoverage(analysis: RawAnalysis, inventory: InventoryLine[]) {
+  const validIds = new Set(inventory.map((line) => line.id));
+  const claimed = new Set<string>();
+  let invalidReferences = 0;
+  let duplicateReferences = 0;
+  const nodes: Array<RawNode & { lineIds: string[] }> = [];
+  const retained = new Set<string>();
+  for (const raw of analysis.nodes ?? []) {
+    const expanded = expandLineRefs(raw.lineRefs ?? raw.lineIds, inventory);
+    invalidReferences += expanded.invalid;
+    const lineIds: string[] = [];
+    for (const id of expanded.ids) {
+      if (!validIds.has(id)) invalidReferences += 1;
+      else if (claimed.has(id)) duplicateReferences += 1;
+      else {
+        claimed.add(id);
+        lineIds.push(id);
+      }
+    }
+    if (!lineIds.length) continue;
+    const node = { ...raw };
+    delete node.lineRefs;
+    nodes.push({ ...node, lineIds });
+    retained.add(node.id);
+  }
+  return {
+    analysis: { nodes, edges: (analysis.edges ?? []).filter((edge) => retained.has(edge.source) && retained.has(edge.target)) },
+    missing: inventory.filter((line) => !claimed.has(line.id)),
+    coverage: { expected: inventory.length, assigned: claimed.size, unknown: 0, invalidReferences, duplicateReferences },
+  };
+}
+
+function applyRepair(validated: ReturnType<typeof validateCoverage>, repair: RepairResult, inventory: InventoryLine[]) {
+  const nodes = validated.analysis.nodes.map((node) => ({ ...node, lineIds: [...node.lineIds] }));
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  for (const assignment of repair.existingAssignments ?? []) {
+    byId.get(assignment.nodeId)?.lineIds.push(...expandLineRefs(assignment.lineRefs, inventory).ids);
+  }
+  const next = validateCoverage({ nodes: [...nodes, ...(repair.newNodes ?? [])], edges: [...validated.analysis.edges, ...(repair.edges ?? [])] }, inventory);
+  next.coverage.invalidReferences += validated.coverage.invalidReferences;
+  next.coverage.duplicateReferences += validated.coverage.duplicateReferences;
+  return next;
+}
+
+function finalizeCoverage(validated: ReturnType<typeof validateCoverage>, inventory: InventoryLine[]) {
+  if (!validated.missing.length) return validated;
+  const files = [...new Set(validated.missing.map((line) => line.file))];
+  return {
+    analysis: {
+      ...validated.analysis,
+      nodes: [...validated.analysis.nodes, {
+        id: `coverage-unknown-${validated.missing.length}`,
+        title: "Evidence needs classification",
+        codeIdentity: files.length === 1 ? files[0] : `${files.length} source files`,
+        kind: "unknown",
+        summary: "- The extraction and repair passes could not classify this source evidence reliably.\n- The lines remain visible and owned so coverage is never silently lost.\n- A later focused explanation can replace this low-confidence placeholder.",
+        before: "",
+        after: "",
+        lineIds: validated.missing.map((line) => line.id),
+        confidence: "low",
+        provides: [],
+        uses: [],
+      }],
+    },
+    missing: [],
+    coverage: { ...validated.coverage, assigned: inventory.length, unknown: validated.missing.length },
+  };
+}
+
+function repairPrompt(mode: ReviewMode, attempt: number, content: string, inventory: InventoryLine[], nodes: RawNode[]) {
+  const refs = new Set(inventory.map((line) => line.ref));
+  const missingContent = content.split("\n").filter((line) => {
+    const end = line.indexOf("] ");
+    return line.startsWith("[") && end > 1 && refs.has(line.slice(1, end));
+  }).join("\n");
+  const existing = nodes.map(({ id, title, codeIdentity, kind, summary }) => ({ id, title, codeIdentity, kind, summary }));
+  return `Repair incomplete ChangeGraph evidence ownership. Assign every supplied [L0001] reference exactly once to an existing behavior or a new behavior. Use only exact references; contiguous inclusive spans may use L0001-L0004. Never return paths, source IDs, inventory IDs, or bare numbers. Prefer existing behavior IDs when appropriate. Create a distinct new behavior for a separate function, trigger, branch, fallback, error, state effect, result, configuration, test, or named boundary. Put unclear evidence in a low-confidence unknown behavior. Return only schema-valid JSON.\n\nMode: ${mode}\nRepair attempt: ${attempt}\nExisting behaviors:\n${JSON.stringify(existing)}\n\nMissing evidence:\n${missingContent}`;
 }
 
 function extractOutputText(response: Record<string, unknown>) {
@@ -329,38 +489,89 @@ export async function POST(request: Request) {
   }
 
   const model = process.env.OPENAI_MODEL || "gpt-5.4-mini";
-  const upstream = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      model,
-      store: false,
-      input: action === "integrate"
-        ? buildIntegrationPrompt(mode, body.nodes ?? [], body.integrationKind, body.integrationFocus)
-        : action === "order"
-          ? buildJourneyOrderingPrompt(body)
-          : buildPrompt(mode, body.task || "", content ?? "", body.inventory ?? [], body.baselineContext ?? []),
-      text: {
-        format: {
-          type: "json_schema",
-          name: action === "integrate" ? "semantic_graph_connections" : action === "order" ? body.orderingKind === "stages" ? "journey_stage_order" : "journey_reading_order" : "semantic_code_graph",
-          strict: true,
-          schema: action === "integrate" ? INTEGRATION_SCHEMA : action === "order" ? body.orderingKind === "stages" ? JOURNEY_STAGE_SCHEMA : JOURNEY_ORDER_SCHEMA : ANALYSIS_SCHEMA,
-        },
-      },
-    }),
-  });
-
-  const responseBody = await upstream.json() as Record<string, unknown>;
-  if (!upstream.ok) {
-    const nestedError = responseBody.error && typeof responseBody.error === "object" ? (responseBody.error as { message?: string }).message : undefined;
-    return Response.json({ error: nestedError || `OpenAI request failed (${upstream.status}).` }, { status: 502 });
-  }
-
   try {
-    const parsed = JSON.parse(extractOutputText(responseBody));
-    return Response.json(action === "order" ? { provider: `OpenAI API · ${model}`, ordering: parsed } : { provider: `OpenAI API · ${model}`, analysis: parsed });
-  } catch {
-    return Response.json({ error: "OpenAI returned an unreadable semantic graph." }, { status: 502 });
+    const requestStructured = async (input: string, schema: object, name: string, effort: string) => {
+      const reasoningEffort = effort === "minimal" ? "none" : effort;
+      const upstream = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model,
+          store: false,
+          reasoning: { effort: reasoningEffort },
+          input,
+          text: { format: { type: "json_schema", name, strict: true, schema } },
+        }),
+      });
+      const responseBody = await upstream.json() as Record<string, unknown>;
+      if (!upstream.ok) {
+        const nestedError = responseBody.error && typeof responseBody.error === "object" ? (responseBody.error as { message?: string }).message : undefined;
+        throw new Error(nestedError || `OpenAI request failed (${upstream.status}).`);
+      }
+      return { parsed: JSON.parse(extractOutputText(responseBody)) as unknown, usage: responseBody.usage ?? null, reasoningEffort };
+    };
+
+    if (action === "analyze") {
+      const compact = compactRequest(content ?? "", body.inventory ?? []);
+      const extractionEffort = process.env.CHANGEGRAPH_EXTRACTION_REASONING || "low";
+      const primary = await requestStructured(
+        buildPrompt(mode, body.task || "", compact.content, compact.inventory, body.baselineContext ?? []),
+        ANALYSIS_SCHEMA,
+        "semantic_code_graph",
+        extractionEffort,
+      );
+      let validated = validateCoverage(primary.parsed as RawAnalysis, compact.inventory);
+      const usages = [primary.usage];
+      let repairAttempts = 0;
+      let repairFailures = 0;
+      while (validated.missing.length && repairAttempts < 2) {
+        repairAttempts += 1;
+        let repair;
+        try {
+          repair = await requestStructured(
+            repairPrompt(mode, repairAttempts, compact.content, validated.missing, validated.analysis.nodes),
+            REPAIR_SCHEMA,
+            "semantic_coverage_repair",
+            repairAttempts === 1 ? "low" : "medium",
+          );
+        } catch {
+          repairFailures += 1;
+          break;
+        }
+        usages.push(repair.usage);
+        const next = applyRepair(validated, repair.parsed as RepairResult, compact.inventory);
+        if (next.coverage.assigned <= validated.coverage.assigned) break;
+        validated = next;
+      }
+      const finalized = finalizeCoverage(validated, compact.inventory);
+      return Response.json({
+        provider: `OpenAI API · ${model}`,
+        reasoningEffort: extractionEffort === "minimal" ? "none" : extractionEffort,
+        usage: usages,
+        coverage: {
+          ...finalized.coverage,
+          repairAttempts,
+          repairFailures,
+          complete: finalized.coverage.assigned === finalized.coverage.expected,
+          fullyClassified: finalized.coverage.assigned === finalized.coverage.expected && finalized.coverage.unknown === 0,
+        },
+        analysis: finalized.analysis,
+      });
+    }
+
+    const configuredEffort = process.env.CHANGEGRAPH_INTEGRATION_REASONING || "medium";
+    const response = await requestStructured(
+      action === "integrate"
+        ? buildIntegrationPrompt(mode, body.nodes ?? [], body.integrationKind, body.integrationFocus)
+        : buildJourneyOrderingPrompt(body),
+      action === "integrate" ? INTEGRATION_SCHEMA : body.orderingKind === "stages" ? JOURNEY_STAGE_SCHEMA : JOURNEY_ORDER_SCHEMA,
+      action === "integrate" ? "semantic_graph_connections" : body.orderingKind === "stages" ? "journey_stage_order" : "journey_reading_order",
+      configuredEffort,
+    );
+    return Response.json(action === "order"
+      ? { provider: `OpenAI API · ${model}`, reasoningEffort: response.reasoningEffort, usage: response.usage, ordering: response.parsed }
+      : { provider: `OpenAI API · ${model}`, reasoningEffort: response.reasoningEffort, usage: response.usage, analysis: response.parsed });
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : "OpenAI returned an unreadable semantic graph." }, { status: 502 });
   }
 }
