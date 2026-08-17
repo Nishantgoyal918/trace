@@ -41,6 +41,20 @@ ChangeGraph is intentionally language-agnostic. It reasons over source text and 
 - OpenAI API and locally authenticated Codex provider paths
 - Repo-local integrations for Codex and Claude Code
 
+## Examples
+
+### Follow an end-to-end system behavior
+
+The behavior view organizes a journey into readable stages—such as trigger, core logic, async work, coordination, and retry paths—while preserving the connections between them.
+
+![End-to-end ChangeGraph system behavior journey](docs/images/system-behavior-journey.png)
+
+### Trace an explanation back to code
+
+Selecting a behavior opens the complete source file beside the graph and highlights the exact lines used as evidence, so the explanation can be verified without losing the surrounding code context.
+
+![ChangeGraph behavior with highlighted source evidence](docs/images/code-evidence-panel.png)
+
 ## Requirements
 
 - Node.js 22.13 or newer
